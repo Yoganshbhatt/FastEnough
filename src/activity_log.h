@@ -13,6 +13,17 @@
 
 enum class LogLevel { Debug, Info, Warn, Error };
 
+// Thread-safe localtime for both platforms (used across the shared GUI code).
+inline void localTimeSafe(std::tm* out, const std::time_t* clock) {
+#if defined(_WIN32)
+    localtime_s(out, clock);
+#elif defined(__linux__)
+    localtime_r(clock, out);
+#else
+#error Unsupported platform
+#endif
+}
+
 struct LogEntry {
     std::chrono::steady_clock::time_point time;
     std::chrono::system_clock::time_point wallTime;
@@ -31,7 +42,13 @@ public:
         auto clock = std::chrono::system_clock::to_time_t(entry.wallTime);
         auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(entry.wallTime.time_since_epoch()).count()%1000;
         std::tm time{};
+#if defined(_WIN32)
         localtime_s(&time, &clock);
+#elif defined(__linux__)
+        localtime_r(&clock, &time);
+#else
+#error Unsupported platform
+#endif
         const char* levels[] = {"DEBUG", "INFO", "WARN", "ERROR"};
         std::ostringstream line;
         line << std::put_time(&time, "%Y-%m-%d %H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << milliseconds

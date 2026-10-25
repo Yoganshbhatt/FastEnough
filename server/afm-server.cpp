@@ -37,6 +37,8 @@
 #include <atomic>
 #include <mutex>
 #include <fstream>
+#include <filesystem>
+#include <system_error>
 
 #include <motioncam/Decoder.hpp>
 #include <nlohmann/json.hpp>
@@ -214,11 +216,16 @@ static void handle_list(int fd, const char* path, uint32_t path_len) {
         uint64_t size = 0;
         int64_t mtime = 0;
 
-        if (lstat(fullpath, &st) == 0) {
+        if (stat(fullpath, &st) == 0) {
             if (S_ISDIR(st.st_mode)) type = 1;
-            else if (S_ISLNK(st.st_mode)) type = 2;
             else type = 0;
             size = st.st_size;
+            mtime = st.st_mtime;
+        } else if (lstat(fullpath, &st) == 0 && S_ISLNK(st.st_mode)) {
+            // Follow the link for normal entries; a dangling link is exposed
+            // with a zero length rather than the length of its target string.
+            type = 2;
+            size = 0;
             mtime = st.st_mtime;
         }
 
@@ -254,14 +261,21 @@ static void handle_stat(int fd, const char* path, uint32_t path_len) {
 
     struct stat st;
     StatResponse resp;
-    if (lstat(pathbuf, &st) != 0) {
-        resp.type = 255;
-        resp.size = 0;
-        resp.mtime = 0;
+    if (stat(pathbuf, &st) != 0) {
+        struct stat linkSt;
+        if (lstat(pathbuf, &linkSt) == 0 && S_ISLNK(linkSt.st_mode)) {
+            // Dangling symlink: report a zero-length regular entry; reads will
+            // fail with ENOENT, which is truthful for a dangling link.
+            resp.type = 2;
+            resp.size = 0;
+            resp.mtime = linkSt.st_mtime;
+        } else {
+            resp.type = 255;
+            resp.size = 0;
+            resp.mtime = 0;
+        }
     } else {
-        if (S_ISDIR(st.st_mode)) resp.type = 1;
-        else if (S_ISLNK(st.st_mode)) resp.type = 2;
-        else resp.type = 0;
+        resp.type = S_ISDIR(st.st_mode) ? 1 : 0;
         resp.size = st.st_size;
         resp.mtime = st.st_mtime;
     }
@@ -446,11 +460,25 @@ static void sha256_final(SHA256_CTX_AFM* ctx, uint8_t hash[32]) {
     }
 }
 
-// CRC cache — shared by push and pull for instant CMD_CRC32 responses
+// CRC cache — shared by push and pull for instant CMD_CRC32 responses.
+// Single entry: handle_push sets it (file is truncated first, so the CRC
+// covers the full new content). Every other mutator must invalidate it —
+// a stale hit would answer the CRC of overwritten/truncated/deleted bytes.
+// (Found via the Linux port: resume-push bytes verified correct on disk
+// while the first CMD_CRC32 after it served the pre-resume CRC.)
 static pthread_mutex_t g_crc_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char     g_cached_crc_path[PATH_MAX] = {};
 static uint32_t g_cached_crc = 0;
 static int      g_cached_crc_valid = 0;
+
+// Drop the cached entry when path (or any path, when path == nullptr) may
+// have changed content. Cheap: bulk mutators just clear the single entry.
+static void crc_cache_invalidate(const char* path) {
+    pthread_mutex_lock(&g_crc_mutex);
+    if (g_cached_crc_valid && (!path || strcmp(path, g_cached_crc_path) == 0))
+        g_cached_crc_valid = 0;
+    pthread_mutex_unlock(&g_crc_mutex);
+}
 
 static void handle_pull(int fd, const char* path, uint32_t path_len) {
     char pathbuf[PATH_MAX];
@@ -1613,6 +1641,8 @@ static void handle_extract_archive(int fd, const void* payload, uint32_t payload
     unlink(archive);
     snprintf(cmd, sizeof(cmd), "restorecon -RF %s >/dev/null 2>&1 || true", quoted_target);
     system(cmd);
+    // Whole tree rewritten: drop any cached CRC (single entry, cheap).
+    crc_cache_invalidate(nullptr);
     send_ok(fd, NULL, 0);
 }
 
@@ -1789,9 +1819,8 @@ static void handle_push(int fd, const void* payload, uint32_t payload_len) {
         char* slash = strrchr(parent, '/');
         if (slash && slash != parent) {
             *slash = '\0';
-            char cmd[PATH_MAX + 16];
-            snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", parent);
-            system(cmd);
+            std::error_code ec;
+            std::filesystem::create_directories(parent, ec);
             file_fd = open(pathbuf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         }
     }
@@ -1877,15 +1906,25 @@ static void handle_delete(int fd, const char* path, uint32_t path_len) {
 
     int ret;
     if (S_ISDIR(st.st_mode)) {
-        char cmd[PATH_MAX + 16];
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", pathbuf);
-        ret = system(cmd);
+        // Never interpolate a device path into a shell command: filenames can
+        // contain quotes. remove_all() removes the directory and its contents.
+        std::error_code ec;
+        std::filesystem::remove_all(pathbuf, ec);
+        if (ec) {
+            send_error(fd, ec.message().c_str());
+            return;
+        }
+        ret = 0;
     } else {
         ret = unlink(pathbuf);
     }
 
     if (ret != 0) send_error(fd, strerror(errno));
-    else send_ok(fd, NULL, 0);
+    else {
+        // The path is gone: a cached CRC would answer for a deleted file.
+        crc_cache_invalidate(pathbuf);
+        send_ok(fd, NULL, 0);
+    }
 }
 
 static void handle_mkdir(int fd, const char* path, uint32_t path_len) {
@@ -1894,9 +1933,9 @@ static void handle_mkdir(int fd, const char* path, uint32_t path_len) {
     memcpy(pathbuf, path, path_len);
     pathbuf[path_len] = '\0';
 
-    char cmd[PATH_MAX + 16];
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", pathbuf);
-    if (system(cmd) != 0) send_error(fd, "mkdir failed");
+    std::error_code ec;
+    std::filesystem::create_directories(pathbuf, ec);
+    if (ec) send_error(fd, ec.message().c_str());
     else send_ok(fd, NULL, 0);
 }
 
@@ -1943,8 +1982,13 @@ static void handle_rename(int fd, const void* payload, uint32_t payload_len) {
 
     if (rename_result != 0)
         send_error(fd, strerror(errno));
-    else
+    else {
+        // Old path no longer exists; new path cannot have a cache entry
+        // (rename fails when the destination exists). Clear both anyway.
+        crc_cache_invalidate(old_path);
+        crc_cache_invalidate(new_path);
         send_ok(fd, NULL, 0);
+    }
 }
 
 static void handle_crc32(int fd, const char* path, uint32_t path_len) {
@@ -2111,10 +2155,9 @@ static void handle_write_range(int fd, const void* payload, uint32_t payload_len
         char* slash = strrchr(parent, '/');
         if (slash && slash != parent) {
             *slash = '\0';
-            char cmd[PATH_MAX + 16];
-            snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", parent);
-            system(cmd);
-            file_fd = open(pathbuf, O_WRONLY | O_CREAT, 0644);
+            std::error_code ec;
+            std::filesystem::create_directories(parent, ec);
+            if (!ec) file_fd = open(pathbuf, O_WRONLY | O_CREAT, 0644);
         }
     }
     if (file_fd < 0) { send_error(fd, strerror(errno)); return; }
@@ -2169,6 +2212,9 @@ static void handle_write_range(int fd, const void* payload, uint32_t payload_len
     // File was pre-allocated by createFile; blocks are non-overlapping.
     close(file_fd);
 
+    // Bytes changed in place: any cached CRC for this path is stale,
+    // including on partial failure (kept bytes still differ).
+    crc_cache_invalidate(pathbuf);
     if (error) {
         send_error(fd, "Write failed");
     } else {
@@ -2203,10 +2249,143 @@ static void handle_create_file(int fd, const void* payload, uint32_t payload_len
     }
 
     close(file_fd);
+    // O_TRUNC destroyed the previous content: drop any cached CRC.
+    crc_cache_invalidate(pathbuf);
     send_ok(fd, NULL, 0);
 }
 
-// --- Resume handlers ---
+static void handle_create_file_ex(int fd, const void* payload, uint32_t payload_len) {
+    if (payload_len < 12) { send_error(fd, "Invalid create file"); return; }
+
+    uint32_t flags;
+    uint64_t total_size;
+    memcpy(&flags, payload, 4);
+    memcpy(&total_size, (const char*)payload + 4, 8);
+    if (flags & ~(AFM_CREATE_TRUNCATE | AFM_CREATE_EXCLUSIVE)) {
+        send_error(fd, "Invalid create flags");
+        return;
+    }
+    uint32_t path_len = payload_len - 12;
+    char pathbuf[PATH_MAX];
+    if (path_len >= PATH_MAX) { send_error(fd, "Path too long"); return; }
+    memcpy(pathbuf, (const char*)payload + 12, path_len);
+    pathbuf[path_len] = '\0';
+    if (total_size > (uint64_t)INT64_MAX) { send_error(fd, "Size too large"); return; }
+
+    int open_flags = O_WRONLY | O_CREAT;
+    if (flags & AFM_CREATE_TRUNCATE) open_flags |= O_TRUNC;
+    if (flags & AFM_CREATE_EXCLUSIVE) open_flags |= O_EXCL;
+    int file_fd = open(pathbuf, open_flags, 0644);
+    if (file_fd < 0) { send_error(fd, strerror(errno)); return; }
+    // open(O_TRUNC) has already changed the contents; invalidate before the
+    // ftruncate error path so a failed resize cannot leave a stale CRC entry.
+    crc_cache_invalidate(pathbuf);
+    if (total_size > 0 && ftruncate(file_fd, (off_t)total_size) != 0) {
+        const int saved = errno;
+        close(file_fd);
+        send_error(fd, strerror(saved));
+        return;
+    }
+    close(file_fd);
+    crc_cache_invalidate(pathbuf);
+    send_ok(fd, NULL, 0);
+}
+
+static void handle_truncate(int fd, const void* payload, uint32_t payload_len) {
+    if (payload_len < 8) { send_error(fd, "Invalid truncate"); return; }
+    uint64_t size;
+    memcpy(&size, payload, 8);
+    uint32_t path_len = payload_len - 8;
+    char pathbuf[PATH_MAX];
+    if (path_len >= PATH_MAX) { send_error(fd, "Path too long"); return; }
+    memcpy(pathbuf, (const char*)payload + 8, path_len);
+    pathbuf[path_len] = '\0';
+    if (size > (uint64_t)INT64_MAX) { send_error(fd, "Size too large"); return; }
+
+    if (truncate(pathbuf, (off_t)size) != 0) {
+        send_error(fd, strerror(errno));
+        return;
+    }
+    crc_cache_invalidate(pathbuf);
+    send_ok(fd, NULL, 0);
+}
+
+static void handle_remove_file(int fd, const void* payload, uint32_t payload_len) {
+    if (payload_len == 0 || payload_len >= PATH_MAX) { send_error(fd, "Invalid path"); return; }
+    char pathbuf[PATH_MAX];
+    memcpy(pathbuf, payload, payload_len);
+    pathbuf[payload_len] = '\0';
+    // unlink(2), never recursive: FUSE unlink must not remove directories or
+    // their contents by accident.
+    if (unlink(pathbuf) != 0) { send_error(fd, strerror(errno)); return; }
+    crc_cache_invalidate(pathbuf);
+    send_ok(fd, NULL, 0);
+}
+
+static void handle_rmdir(int fd, const void* payload, uint32_t payload_len) {
+    if (payload_len == 0 || payload_len >= PATH_MAX) { send_error(fd, "Invalid path"); return; }
+    char pathbuf[PATH_MAX];
+    memcpy(pathbuf, payload, payload_len);
+    pathbuf[payload_len] = '\0';
+    // rmdir(2) fails with ENOTEMPTY on a non-empty directory, which is the
+    // POSIX contract FUSE expects.
+    if (rmdir(pathbuf) != 0) { send_error(fd, strerror(errno)); return; }
+    crc_cache_invalidate(pathbuf);
+    send_ok(fd, NULL, 0);
+}
+
+static void handle_rename_ex(int fd, const void* payload, uint32_t payload_len) {
+    if (payload_len < 8) { send_error(fd, "Invalid rename"); return; }
+
+    uint32_t flags, old_len;
+    memcpy(&flags, payload, 4);
+    memcpy(&old_len, (const char*)payload + 4, 4);
+    if (flags & ~AFM_RENAME_REPLACE) { send_error(fd, "Invalid rename flags"); return; }
+    if (8 + (uint64_t)old_len > payload_len) { send_error(fd, "Invalid rename"); return; }
+    const uint32_t new_len = payload_len - 8 - old_len;
+    char old_path[PATH_MAX], new_path[PATH_MAX];
+    if (old_len >= PATH_MAX || new_len >= PATH_MAX) { send_error(fd, "Path too long"); return; }
+    memcpy(old_path, (const char*)payload + 8, old_len);
+    old_path[old_len] = '\0';
+    memcpy(new_path, (const char*)payload + 8 + old_len, new_len);
+    new_path[new_len] = '\0';
+
+    int result;
+    if (flags & AFM_RENAME_REPLACE) {
+        result = rename(old_path, new_path);
+    } else {
+#if defined(SYS_renameat2)
+        result = (int)syscall(SYS_renameat2, AT_FDCWD, old_path, AT_FDCWD, new_path,
+                              RENAME_NOREPLACE);
+        if (result != 0 && (errno == ENOSYS || errno == EINVAL || errno == EOPNOTSUPP)) {
+#endif
+            struct stat destination_stat;
+            if (lstat(new_path, &destination_stat) == 0) {
+                errno = EEXIST;
+                result = -1;
+            } else if (errno != ENOENT) {
+                result = -1;
+            } else {
+                result = rename(old_path, new_path);
+            }
+#if defined(SYS_renameat2)
+        }
+#endif
+    }
+
+    if (result != 0) {
+        send_error(fd, strerror(errno));
+        return;
+    }
+    crc_cache_invalidate(old_path);
+    crc_cache_invalidate(new_path);
+    send_ok(fd, NULL, 0);
+}
+
+static void handle_capabilities(int fd) {
+    const uint32_t flags = AFM_CAP_FUSE_WRITE;
+    send_ok(fd, &flags, sizeof(flags));
+}
 
 static void handle_resume_pull(int fd, const void* payload, uint32_t payload_len) {
     if (payload_len < 8) { send_error(fd, "Invalid resume pull"); return; }
@@ -2336,6 +2515,8 @@ static void handle_resume_push(int fd, const void* payload, uint32_t payload_len
     fsync(file_fd);
     close(file_fd);
 
+    // Appended bytes change the content: the push-CRC entry (if any) is stale.
+    crc_cache_invalidate(pathbuf);
     if (error) {
         send_error(fd, "Write error (partial file kept for resume)");
     } else {
@@ -2826,6 +3007,12 @@ static void handle_client(int client_fd) {
             case CMD_INSTALL_BATCH: handle_install_batch(client_fd, payload_buf, hdr.length); break;
             case CMD_RESTORE_BACKUP_ARCHIVE: handle_restore_backup_archive(client_fd, payload_buf, hdr.length); break;
             case CMD_CREATE_BACKUP_ARCHIVE: handle_create_backup_archive(client_fd, payload_buf, hdr.length); break;
+            case CMD_CREATE_FILE_EX: handle_create_file_ex(client_fd, payload_buf, hdr.length); break;
+            case CMD_TRUNCATE:       handle_truncate(client_fd, payload_buf, hdr.length); break;
+            case CMD_RENAME_EX:      handle_rename_ex(client_fd, payload_buf, hdr.length); break;
+            case CMD_CAPABILITIES:   handle_capabilities(client_fd); break;
+            case CMD_REMOVE_FILE:    handle_remove_file(client_fd, payload_buf, hdr.length); break;
+            case CMD_RMDIR:          handle_rmdir(client_fd, payload_buf, hdr.length); break;
             default:              send_error(client_fd, "Unknown command"); break;
         }
     }

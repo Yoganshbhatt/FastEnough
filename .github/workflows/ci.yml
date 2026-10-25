@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main, linux-port]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (CMake, tests, package)
+    runs-on: ubuntu-22.04
+    env:
+      GLFW_PREFIX: ${{ github.workspace }}/.deps/glfw
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check platform-guard balance
+        run: python3 tools/check_guard_balance.py src tools
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config curl unzip git \
+            libfuse3-dev libgl1-mesa-dev libgtk-3-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+
+      # Ubuntu 22.04 ships GLFW 3.3, which lacks the Wayland application id and
+      # the X11 class hints. Build 3.4 statically so the shipped binary is
+      # self-contained and still sets its desktop identity.
+      - name: Cache GLFW
+        uses: actions/cache@v4
+        with:
+          path: .deps/glfw
+          key: glfw-3.4-static-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build GLFW 3.4 (static)
+        run: |
+          set -euo pipefail
+          if [ -f "$GLFW_PREFIX/lib/libglfw3.a" ]; then
+            echo "GLFW already cached"
+            exit 0
+          fi
+          git clone --depth 1 --branch 3.4 https://github.com/glfw/glfw.git /tmp/glfw
+          cmake -S /tmp/glfw -B /tmp/glfw/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GLFW_PREFIX" \
+            -DGLFW_BUILD_SHARED_LIBS=OFF \
+            -DGLFW_BUILD_WAYLAND=ON -DGLFW_BUILD_X11=ON \
+            -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF \
+            -DGLFW_BUILD_DOCS=OFF
+          cmake --build /tmp/glfw/build
+          cmake --install /tmp/glfw/build
+
+      - name: Vendor ImGui
+        run: ./setup.sh
+
+      - name: Configure and test (default build)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$GLFW_PREFIX"
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+
+      - name: Configure and build (GUI)
+        run: |
+          cmake -S . -B build-gui -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DAFM_BUILD_GUI=ON -DCMAKE_PREFIX_PATH="$GLFW_PREFIX"
+          cmake --build build-gui
+
+      - name: Fetch platform-tools (bundled, matches Windows release)
+        run: |
+          curl -fsSL -o /tmp/platform-tools.zip \
+            https://dl.google.com/android/repository/platform-tools-latest-linux.zip
+          unzip -q /tmp/platform-tools.zip -d thirdparty/android-platform-tools
+          test -x thirdparty/android-platform-tools/platform-tools/adb
+
+      - name: Package release tarball
+        run: scripts/package-release.sh --version v0.0.0 --build-dir build-gui --skip-build --out dist
+
+      - name: Verify packaged binaries
+        run: |
+          set -euo pipefail
+          tar -xzf dist/fast-enough-*.tar.gz -C dist
+          root="$(find dist -maxdepth 1 -type d -name 'fast-enough-*' | head -1)"
+          test -x "$root/fast-enough"
+          test -x "$root/afm-cli"
+          file "$root/afm-server" | grep -q 'ARM aarch64'
+          test -f "$root/afm-labels.dex"
+          test -f "$root/share/applications/fast-enough.desktop"
+          # The tarball must not depend on a distribution GLFW build.
+          if ldd "$root/fast-enough" | grep -q libglfw; then
+            echo "GLFW was linked dynamically" >&2; exit 1
+          fi
+          # Keep the glibc floor at the runner baseline so the artifact runs on
+          # older distributions instead of only the newest ones.
+          floor="$(objdump -T "$root/fast-enough" | grep -o 'GLIBC_2\.[0-9]*' | sort -Vu | tail -1)"
+          echo "glibc floor: $floor"
+          # Older is better: accept any floor at or below the runner baseline.
+          test "$(printf '%s\n' 'GLIBC_2.35' "$floor" | sort -V | head -1)" = "$floor"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fast-enough-linux-x86_64
+          path: dist/fast-enough-*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows (MSVC, vcxproj)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Vendor ImGui
+        shell: pwsh
+        run: ./setup.ps1
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          msbuild "Android File Manager.vcxproj" `
+            -p:Configuration=Release -p:Platform=x64 -m -verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          $exe = "x64\Release\Fast Enough - Android File Explorer.exe"
+          if (-not (Test-Path -LiteralPath $exe)) { throw "missing $exe" }
+          Write-Host ("built {0:N0} bytes" -f (Get-Item -LiteralPath $exe).Length)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fast-enough-windows-x64
+          path: |
+            x64/Release/Fast Enough - Android File Explorer.exe
+            thirdparty/dokan/lib/x64/dokan2.dll
+          if-no-files-found: error

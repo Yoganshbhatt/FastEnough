@@ -171,7 +171,8 @@ bool BackupArchive::createStore(const std::filesystem::path& sourceRoot,
     });
 
     std::filesystem::create_directories(archivePath.parent_path(), ec);
-    const auto temporaryPath = archivePath.wstring() + L".tmp";
+    std::filesystem::path temporaryPath = archivePath;
+    temporaryPath += ".tmp";
     std::ofstream out(temporaryPath, std::ios::binary | std::ios::trunc);
     if (!out) {
         error = "Could not create backup archive";
@@ -335,7 +336,8 @@ bool BackupArchive::createSelection(const std::filesystem::path& sourceArchive,
 
     std::error_code ec;
     std::filesystem::create_directories(archivePath.parent_path(), ec);
-    const auto temporaryPath = archivePath.wstring() + L".tmp";
+    std::filesystem::path temporaryPath = archivePath;
+    temporaryPath += ".tmp";
     std::ifstream input(sourceArchive, std::ios::binary);
     std::ofstream out(temporaryPath, std::ios::binary | std::ios::trunc);
     if (!input || !out) {

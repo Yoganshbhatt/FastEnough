@@ -1,4 +1,5 @@
 #include "app.h"
+#include "crt_shims.h"
 #include "device_dokan.h"
 #include <algorithm>
 #include <map>

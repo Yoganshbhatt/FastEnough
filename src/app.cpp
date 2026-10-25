@@ -5,9 +5,15 @@
 #include "backup_archive.h"
 #include "imgui_internal.h"
 #include "mcraw_local.h"
+#if defined(_WIN32)
 #include "mcraw_projfs.h"
 #include "device_dokan.h"
+#else
+#include "mount_stubs.h"
+#include "platform_linux.h"
+#endif
 #include "transfer_coverage.h"
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -19,6 +25,19 @@
 #include <shobjidl.h>
 #include <shlobj.h>
 #include <wincrypt.h>
+#include <ole2.h>
+#include <shlwapi.h>
+#elif defined(__linux__)
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <fnmatch.h>
+#include <functional>
+#include <netdb.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <sstream>
 #include <algorithm>
 #include <ctime>
@@ -33,10 +52,8 @@
 #include <thread>
 #include <condition_variable>
 #include <deque>
-#include <ole2.h>
-#include <shlobj.h>
-#include <shlwapi.h>
 #include <nlohmann/json.hpp>
+#if defined(_WIN32)
 #include <iphlpapi.h>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -44,7 +61,33 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "comdlg32.lib")
+#endif
 
+#include "crt_shims.h"
+
+#if defined(__linux__)
+// pwrite() may write fewer bytes than asked for, and a swallowed error here
+// would silently corrupt the destination file. Loop until the range is fully
+// written, retrying on EINTR.
+static bool localPwriteFully(int fd, const void* data, size_t len, off_t offset) {
+    const char* cursor = static_cast<const char*>(data);
+    size_t done = 0;
+    while (done < len) {
+        const ssize_t n = ::pwrite(fd, cursor + done, len - done,
+                                   offset + static_cast<off_t>(done));
+        if (n > 0) {
+            done += static_cast<size_t>(n);
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+#if defined(_WIN32)
 // Safe UTF-8 path-to-string helper (avoids ANSI code page issues with .string())
 static std::string pathToUtf8(const std::filesystem::path& p) {
     auto ws = p.wstring();
@@ -68,6 +111,20 @@ static std::wstring toWide(const std::string& utf8) {
 static std::filesystem::path toFsPath(const std::string& utf8) {
     return std::filesystem::path(toWide(utf8));
 }
+#else
+// Linux: paths are bytes; std::filesystem::path(narrow) is exact, no codepage.
+static std::string pathToUtf8(const std::filesystem::path& p) { return p.string(); }
+static std::filesystem::path toFsPath(const std::string& utf8) { return std::filesystem::path(utf8); }
+#endif
+
+// User-facing name of the recoverable-delete store (Windows Recycle Bin,
+// Linux Freedesktop Trash). Used by the shared delete confirmation UI.
+#if defined(_WIN32)
+static constexpr const char* kTrashName = "Recycle Bin";
+#else
+static constexpr const char* kTrashName = "Trash";
+#endif
+static const std::string kMoveToTrashLabel = std::string("Move to ") + kTrashName;
 
 static constexpr const char* kBackupArchiveReferenceSeparator = "|fezip|";
 
@@ -157,7 +214,31 @@ static bool readBackupMetadata(const std::string& reference, nlohmann::json& met
     return true;
 }
 
+// Local separators differ by platform; Android paths always use '/'.
+#if defined(_WIN32)
+constexpr char kLocalPathSeparator = '\\';
+#else
+constexpr char kLocalPathSeparator = '/';
+#endif
+constexpr char pathSeparatorFor(bool isAndroid) {
+    return isAndroid ? '/' : kLocalPathSeparator;
+}
+
+// Default location for a local pane: the drive list on Windows, $HOME on Linux.
+static std::string defaultLocalRoot() {
+#if defined(_WIN32)
+    return "C:\\";
+#else
+    const char* home = ::getenv("HOME");
+    return (home && *home) ? std::string(home) : std::string("/");
+#endif
+}
+
 static void appendPathSeparator(std::string& path, char sep) {
+#if !defined(_WIN32)
+    // Call sites pass '\\' for "local"; on Linux that is '/'.
+    if (sep == '\\') sep = '/';
+#endif
     if (path.empty()) {
         path.push_back(sep);
     } else if (path.back() != sep) {
@@ -169,7 +250,7 @@ static char lastCharOr(const std::string& value, char fallback = '\0') {
     return value.empty() ? fallback : value.back();
 }
 
-static void alignTextToCompactFrame() {
+[[maybe_unused]] static void alignTextToCompactFrame() {
     ImGui::GetCurrentWindow()->DC.CurrLineTextBaseOffset =
         ImGui::GetStyle().FramePadding.y * 0.62f;
 }
@@ -216,8 +297,14 @@ static std::string normalizeCompareName(std::string name) {
 
 static bool fileNameMatchesFilter(const std::string& name, const std::string& filter) {
     if (filter.empty()) return true;
+#if defined(_WIN32)
     if (filter.find_first_of("*?") != std::string::npos)
         return PathMatchSpecW(toWide(name).c_str(), toWide(filter).c_str()) == TRUE;
+#else
+    // fnmatch-based wildcard match (same semantics: * ? [class]).
+    if (filter.find_first_of("*?") != std::string::npos)
+        return ::fnmatch(filter.c_str(), name.c_str(), FNM_CASEFOLD) == 0;
+#endif
 
     std::string normalizedName = normalizeCompareName(name);
     std::string normalizedFilter = normalizeCompareName(filter);
@@ -257,6 +344,7 @@ static std::string makeUniquePanelName(
     }
 }
 
+#if defined(_WIN32)
 static std::string bytesToHex(const BYTE* data, DWORD len) {
     static const char* hex = "0123456789abcdef";
     std::string out;
@@ -268,7 +356,9 @@ static std::string bytesToHex(const BYTE* data, DWORD len) {
     }
     return out;
 }
+#endif
 
+#if defined(_WIN32)
 static bool computeCompareLocalSha256(const std::string& path, std::string& outSha256, std::string& detail) {
     HANDLE hFile = CreateFileW(toWide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -326,6 +416,11 @@ static bool computeCompareLocalSha256(const std::string& path, std::string& outS
     CryptReleaseContext(prov, 0);
     return true;
 }
+#else
+static bool computeCompareLocalSha256(const std::string& path, std::string& outSha256, std::string& detail) {
+    return platform::computeLocalSha256(path, outSha256, detail);
+}
+#endif
 
 static uint64_t directorySizeBytes(const std::filesystem::path& dir) {
     uint64_t total = 0;
@@ -341,7 +436,7 @@ static std::string backupJobStamp() {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm tm{};
-    localtime_s(&tm, &t);
+    localTimeSafe(&tm, &t);
     std::ostringstream ss;
     ss << std::put_time(&tm, "%Y%m%d-%H%M%S");
     return ss.str();
@@ -357,6 +452,7 @@ static std::string formatBackupCreated(const std::string& created) {
     return created;
 }
 
+#if defined(_WIN32)
 static std::vector<DetectedNic> enumerateNics() {
     std::vector<DetectedNic> result;
     ULONG bufLen = 16384;
@@ -401,7 +497,13 @@ static std::vector<DetectedNic> enumerateNics() {
     }
     return result;
 }
+#else
+static std::vector<DetectedNic> enumerateNics() {
+    return platform::enumerateNics();
+}
+#endif
 
+#if defined(_WIN32)
 class SimpleDropSource : public IDropSource {
     LONG m_ref = 1;
 public:
@@ -1029,15 +1131,49 @@ void App::performAndroidDragOut(FilePanel* src) {
     worker.detach();
 }
 
+#else
+// Linux: OLE drag-and-drop has no direct equivalent, because XDND cannot
+// stream virtual files the way Windows does. The app exposes Export to
+// Folder… instead. Keep the API surface: local drags materialize nothing
+// (no-op), Android drags pull to temp then open the file manager there.
+void App::performOleDragDrop(const std::vector<std::string>& filePaths) {
+    (void)filePaths;
+    if (m_dragSourcePanel) {
+        m_dragSourcePanel->selectedIndices.clear();
+        m_dragSourcePanel->focusedIndex = -1;
+    }
+    m_dragSourcePanel = nullptr;
+    m_isDragging = false;
+    LOG_INFO("UI", "Drag-out to file manager is not yet available on Linux");
+}
+
+void App::performAndroidDragOut(FilePanel* src) {
+    (void)src;
+    if (m_dragSourcePanel) {
+        m_dragSourcePanel->selectedIndices.clear();
+        m_dragSourcePanel->focusedIndex = -1;
+    }
+    m_dragSourcePanel = nullptr;
+    m_isDragging = false;
+    LOG_INFO("UI", "Android drag-out is not yet available on Linux; use Copy instead");
+}
+#endif  // _WIN32 (OLE drag stack)
+
 static bool isWifiSerial(const std::string& serial) {
     return isWirelessAdbSerial(serial);
 }
 
 static bool endsWithCI(const std::string& s, const std::string& suffix) {
+#if defined(_WIN32)
     if (s.size() < suffix.size()) return false;
     return _stricmp(s.c_str() + s.size() - suffix.size(), suffix.c_str()) == 0;
+#else
+    if (s.size() < suffix.size()) return false;
+    return ::strcasecmp(s.c_str() + s.size() - suffix.size(), suffix.c_str()) == 0;
+#endif
 }
 
+#if defined(_WIN32)
 static std::string getPrefsPath() {
     char path[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path))) {
@@ -1047,6 +1183,24 @@ static std::string getPrefsPath() {
     }
     return "";
 }
+#else
+static std::string getPrefsPath() {
+    // XDG config home, matching AGENTS.md conventions.
+    const char* xdg = ::getenv("XDG_CONFIG_HOME");
+    std::string base;
+    if (xdg && *xdg) {
+        base = xdg;
+    } else if (const char* home = ::getenv("HOME")) {
+        base = std::string(home) + "/.config";
+    }
+    if (base.empty()) return "";
+    std::string dir = base + "/FastEnough";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return "";
+    return dir + "/preferences.ini";
+}
+#endif
 
 void AppPreferences::save() {
     std::string path = getPrefsPath();
@@ -1269,6 +1423,7 @@ void AppPreferences::load() {
     }
 }
 
+#if defined(_WIN32)
 std::string AppTheme::getThemePath() {
     char path[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path))) {
@@ -1278,6 +1433,12 @@ std::string AppTheme::getThemePath() {
     }
     return "";
 }
+#else
+std::string AppTheme::getThemePath() {
+    std::string prefs = getPrefsPath();  // same dir, XDG-safe
+    return prefs.empty() ? "" : prefs.substr(0, prefs.rfind('/')) + "/theme.ini";
+}
+#endif
 
 void AppTheme::save() {
     std::string path = getThemePath();
@@ -1347,9 +1508,12 @@ void AppTheme::load() {
 
 // Defined in main.cpp — for real quit (bypassing minimize-to-tray)
 extern bool g_reallyQuit;
+#if defined(_WIN32)
 extern HWND g_mainHwnd;
+#endif
 
 // IFileOperation-based delete: recycle bin or permanent
+#if defined(_WIN32)
 static bool deleteWindowsFiles(const std::vector<std::string>& paths, bool permanent, std::string& error) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     bool needUninit = SUCCEEDED(hr);
@@ -1393,6 +1557,131 @@ static bool deleteWindowsFiles(const std::vector<std::string>& paths, bool perma
     }
     return true;
 }
+#else
+static bool deleteWindowsFiles(const std::vector<std::string>& paths, bool permanent, std::string& error) {
+    return platform::deleteLocalFiles(paths, permanent, error);
+}
+#endif
+
+#if defined(_WIN32)
+static bool confirmBox(const char* title, const std::string& prompt) {
+    return MessageBoxA(g_mainHwnd, prompt.c_str(), title, MB_YESNO | MB_ICONWARNING) == IDYES;
+}
+#else
+// Linux: no MessageBox. Destructive ops must still be confirmed, so shell
+// out to zenity (GTK dep, present on Arch/CachyOS). argv is exec'd directly
+// (no shell interpolation of the prompt).
+static bool confirmBox(const char* title, const std::string& prompt) {
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        execlp("zenity", "zenity", "--question", "--title", title,
+               "--text", prompt.c_str(), (char*)nullptr);
+        _exit(127);  // zenity missing -> deny (fail safe)
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// File-open/save via zenity (GTK dep, always present on Arch/CachyOS).
+// Runs zenity with a captured stdout pipe; onPick fires with the chosen path
+// or never when the dialog is cancelled / zenity is missing (fail safe).
+static void runZenityFilePicker(char* const argv[], size_t argc,
+                                const std::function<void(const std::string&)>& onPick) {
+    (void)argc;
+    int fds[2];
+    if (::pipe(fds) != 0) return;
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(fds[0]);
+        ::close(fds[1]);
+        return;
+    }
+    if (pid == 0) {
+        ::close(fds[0]);
+        ::dup2(fds[1], STDOUT_FILENO);
+        const int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) ::dup2(devnull, STDERR_FILENO);
+        ::execvp("zenity", argv);
+        _exit(127);  // zenity missing -> nothing picked
+    }
+    ::close(fds[1]);
+    std::string result;
+    char buf[4096];
+    for (;;) {
+        const ssize_t n = ::read(fds[0], buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        result.append(buf, static_cast<size_t>(n));
+    }
+    ::close(fds[0]);
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+        result.pop_back();
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && !result.empty() && onPick)
+        onPick(result);
+}
+
+static void pickFileViaZenity(const std::function<void(const std::string&)>& onPick,
+                              const std::string& filter) {
+    std::string patterns = filter;
+    // Convert "Desc|*.ext|Desc2|*.ext2" to zenity's "Desc | *.ext" pairs by
+    // passing each pair as its own --file-filter argument.
+    std::vector<std::string> args{"zenity", "--file-selection", "--title", "Select file"};
+    size_t pos = 0;
+    while (pos < patterns.size()) {
+        const size_t bar1 = patterns.find('|', pos);
+        if (bar1 == std::string::npos) break;
+        const size_t bar2 = patterns.find('|', bar1 + 1);
+        const std::string desc = patterns.substr(pos, bar1 - pos);
+        const std::string pat =
+            (bar2 == std::string::npos) ? patterns.substr(bar1 + 1)
+                                        : patterns.substr(bar1 + 1, bar2 - bar1 - 1);
+        std::string zfilter = desc + " | " + pat;
+        args.push_back("--file-filter");
+        args.push_back(zfilter);
+        if (bar2 == std::string::npos) break;
+        pos = bar2 + 1;
+    }
+    args.push_back("--file-filter");
+    args.push_back("All files | *");
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    runZenityFilePicker(argv.data(), argv.size(), onPick);
+}
+
+// Folder picker for the Linux drag-out fallback ("Export to Folder...").
+static void pickFolderViaZenity(const std::function<void(const std::string&)>& onPick,
+                                const std::string& title) {
+    std::vector<std::string> args{"zenity", "--file-selection", "--directory",
+                                  "--title", title};
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    runZenityFilePicker(argv.data(), argv.size(), onPick);
+}
+
+static void pickSaveFileViaZenity(const std::function<void(const std::string&)>& onPick,
+                                  const std::string& defaultName) {
+    std::vector<std::string> args{"zenity", "--file-selection", "--save", "--confirm-overwrite",
+                                  "--title", "Save file", "--filename", defaultName};
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    runZenityFilePicker(argv.data(), argv.size(), onPick);
+}
+#endif
 
 App::App() {
     m_prefs.load();
@@ -1409,7 +1698,7 @@ App::App() {
     m_secondaryChannel.setLocalPort(AFM_PORT + 2);
 
     m_leftPanel.isAndroid = false;
-    m_leftPanel.currentPath = "C:\\";
+    m_leftPanel.currentPath = defaultLocalRoot();
     strcpy_s(m_leftPanel.pathInput, m_leftPanel.currentPath.c_str());
 
     m_rightPanel.isAndroid = true;
@@ -1447,8 +1736,14 @@ App::~App() {
 
     // Release wakelock process if still running
     if (m_wakeLockProcess) {
+#if defined(_WIN32)
         TerminateProcess(m_wakeLockProcess, 0);
         CloseHandle(m_wakeLockProcess);
+#else
+        const pid_t pid = static_cast<pid_t>(reinterpret_cast<intptr_t>(m_wakeLockProcess));
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, nullptr, 0);
+#endif
         m_wakeLockProcess = nullptr;
     }
 
@@ -1711,7 +2006,10 @@ void App::drainUiMessages() {
 
 void App::connectDeviceBySerialNow(const std::string& serial) {
     if (serial.empty() || m_shutdownPoll) return;
-    discoverDeviceIdentities({DeviceInfo{serial, {}, "device"}});
+    DeviceInfo seed{};
+    seed.serial = serial;
+    seed.state = "device";
+    discoverDeviceIdentities({seed});
     int slot = m_deviceSessions.ensure(deviceIdentity(serial));
     if (deviceSession(slot).connected && deviceForSlot(slot).isServerRunning()) return;
     prepareDeviceSession(slot, serial);
@@ -1730,6 +2028,7 @@ void App::addKnownPrimarySerials(std::set<std::string>& serials, const std::stri
     }
 }
 
+#if defined(_WIN32)
 static bool windowsUsesLightAppTheme() {
     DWORD value = 0;
     DWORD size = sizeof(value);
@@ -1738,12 +2037,19 @@ static bool windowsUsesLightAppTheme() {
         "AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
     return status == ERROR_SUCCESS && value != 0;
 }
+#else
+static bool windowsUsesLightAppTheme() {
+    return platform::systemUsesLightAppTheme();
+}
+#endif
 
 void App::setupStyle() {
     ImGui::GetStyle() = ImGuiStyle();
     m_resolvedLightTheme = m_theme.mode == 2 || (m_theme.mode == 0 && windowsUsesLightAppTheme());
+#if defined(_WIN32)
     BOOL darkTitle = !m_resolvedLightTheme;
     if (g_mainHwnd) DwmSetWindowAttribute(g_mainHwnd, 20, &darkTitle, sizeof(darkTitle));
+#endif
     if (m_resolvedLightTheme) ImGui::StyleColorsLight(); else ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 8;
@@ -1901,14 +2207,14 @@ void App::render() {
             std::string name = focused->entryName(focused->focusedIndex);
             bool isDir = focused->entryIsDir(focused->focusedIndex);
             if (isDir) {
-                std::string sep = focused->isAndroid ? "/" : "\\";
+                std::string sep(1, pathSeparatorFor(focused->isAndroid));
                 std::string np = focused->currentPath;
                 appendPathSeparator(np, sep[0]);
                 np += name;
                 navigateToDirectory(*focused, np);
             } else if (endsWithCI(name, ".mcraw") && !focused->isAndroid) {
                 std::string mcrawFullPath = focused->currentPath;
-                appendPathSeparator(mcrawFullPath, '\\');
+                appendPathSeparator(mcrawFullPath, pathSeparatorFor(focused->isAndroid));
                 mcrawFullPath += name;
                 postAsync("Mounting MCRAW...", [this, mcrawFullPath, focused]() {
                     std::string mountPath = McrawMountManager::instance().mountMcraw(mcrawFullPath);
@@ -1942,7 +2248,7 @@ void App::render() {
         FilePanel* focused = m_lastFocusedPanel;
         if (focused && !focused->isApps && !focused->isConnections && !focused->selectedIndices.empty()) {
             m_clipboardPaths.clear();
-            std::string sep = focused->isAndroid ? "/" : "\\";
+            std::string sep(1, pathSeparatorFor(focused->isAndroid));
             for (int idx : focused->selectedIndices) {
                 if (!focused->validIndex(idx)) continue;
                 std::string p = focused->currentPath;
@@ -1961,7 +2267,7 @@ void App::render() {
         FilePanel* focused = m_lastFocusedPanel;
         if (focused && !focused->isApps && !focused->isConnections && !focused->selectedIndices.empty()) {
             m_clipboardPaths.clear();
-            std::string sep = focused->isAndroid ? "/" : "\\";
+            std::string sep(1, pathSeparatorFor(focused->isAndroid));
             for (int idx : focused->selectedIndices) {
                 if (!focused->validIndex(idx)) continue;
                 std::string p = focused->currentPath;
@@ -2499,7 +2805,9 @@ void App::renderMenuBar() {
                     m_showCloseConfirm = true;
                 } else {
                     g_reallyQuit = true;
+#if defined(_WIN32)
                     PostMessage(g_mainHwnd, WM_CLOSE, 0, 0);
+#endif
                 }
             }
             ImGui::EndMenu();
@@ -2568,8 +2876,9 @@ void App::renderMenuBar() {
             if (m_asyncBusy) {
                 ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Working: %s", m_asyncStatus.c_str());
             } else if (hasDevice) {
-                bool isDirect = m_device.isDirectConnection();
-                bool isConnected = m_device.isServerRunning();
+#if defined(_WIN32) || !defined(NDEBUG)
+                (void)m_device;  // referenced by the hidden debug block below
+#endif
 
 #if 0 // Hidden: superseded by USB 2x / WiFi 2x multi-pipe options
                 if (ImGui::MenuItem("Connection Mode...")) {
@@ -2659,7 +2968,11 @@ void App::renderMenuBar() {
                 for (int slot = 0; slot < deviceSessionCount(); slot++) {
                     if (!deviceSession(slot).connected) continue;
                     auto& mgr = DeviceMountManager::instance(slot);
+#if defined(_WIN32)
                     std::string driveLetter = DeviceMountManager::availableMountPoint();
+#else
+                    std::string driveLetter = DeviceMountManager::availableMountPoint(slot);
+#endif
                     std::string slotLabel = deviceSession(slot).serial;
                     if (slotLabel.size() > 12) slotLabel = slotLabel.substr(0, 12) + "..";
 
@@ -2672,24 +2985,67 @@ void App::renderMenuBar() {
                                 DeviceMountManager::instance(slot).unmount();
                             });
                         }
+#if defined(_WIN32)
                         std::string openId = "Open " + mp + " in Explorer##" + std::to_string(slot);
+#else
+                        std::string openId = "Open " + mp + " in file manager##" + std::to_string(slot);
+#endif
                         if (ImGui::MenuItem(openId.c_str())) {
+#if defined(_WIN32)
                             ShellExecuteA(nullptr, "explore", mp.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+                            std::string err;
+                            platform::shellOpen(mp, err);
+#endif
                         }
                     } else {
+#if defined(_WIN32)
                         std::string mountId = "Mount " + slotLabel + " as " + driveLetter + "##" + std::to_string(slot);
+#else
+                        std::string mountId = "Mount " + slotLabel + " at " + driveLetter +
+                            " (read-only)##" + std::to_string(slot);
+#endif
                         if (ImGui::MenuItem(mountId.c_str())) {
                             std::string sr = deviceSession(slot).storageRoot;
                             postAsync("Mounting virtual drive...", [this, slot, sr, driveLetter]() {
                                 if (DeviceMountManager::instance(slot).mount(&deviceSession(slot).client, sr, driveLetter)) {
                                     m_statusMessage = "Mounted: " + driveLetter;
+#if defined(_WIN32)
                                     ShellExecuteA(nullptr, "explore", driveLetter.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+                                    std::string err;
+                                    platform::shellOpen(driveLetter, err);
+#endif
                                 } else {
+#if defined(_WIN32)
                                     m_statusMessage = "Mount failed — is Dokan driver installed?";
+#else
+                                    m_statusMessage = "Mount failed — is libfuse3 installed?";
+#endif
                                 }
                                 m_statusTime = std::chrono::steady_clock::now();
                             });
                         }
+#if !defined(_WIN32)
+                        // Explicit opt-in: a writable mount exposes the device
+                        // filesystem to normal file operations. Keep read-only
+                        // as the default and make the write choice deliberate.
+                        std::string rwId = "Mount " + slotLabel + " at " + driveLetter +
+                            " (read-write)##" + std::to_string(slot);
+                        if (ImGui::MenuItem(rwId.c_str())) {
+                            std::string sr = deviceSession(slot).storageRoot;
+                            postAsync("Mounting writable virtual drive...", [this, slot, sr, driveLetter]() {
+                                if (DeviceMountManager::instance(slot).mount(&deviceSession(slot).client, sr, driveLetter, true)) {
+                                    m_statusMessage = "Mounted (read-write): " + driveLetter;
+                                    std::string err;
+                                    platform::shellOpen(driveLetter, err);
+                                } else {
+                                    m_statusMessage = "Writable mount failed — the phone helper must be rebuilt (read-only mount is still available)";
+                                }
+                                m_statusTime = std::chrono::steady_clock::now();
+                            });
+                        }
+#endif
                     }
                 }
 
@@ -2991,7 +3347,7 @@ std::string App::favoriteLabelForPath(const std::string& path, bool isAndroid) {
     std::string trimmed = path;
     while (trimmed.size() > 1 && (lastCharOr(trimmed) == '/' || lastCharOr(trimmed) == '\\')) trimmed.pop_back();
     if (!isAndroid && trimmed.size() == 2 && trimmed[1] == ':') return trimmed + "\\";
-    size_t pos = trimmed.find_last_of(isAndroid ? "/" : "\\");
+    size_t pos = trimmed.find_last_of(pathSeparatorFor(isAndroid));
     if (pos == std::string::npos) return trimmed;
     std::string label = trimmed.substr(pos + 1);
     if (label.empty()) return isAndroid ? "/" : trimmed;
@@ -3034,6 +3390,7 @@ void App::removeFavoritePath(int index) {
 }
 
 void App::renderFavoritesBar(FilePanel& panel, PanelSide side) {
+    (void)side;  // favorites bar renders identically on both panes
     const float scale = ui::scale();
     bool favorite = isFavoritePath(panel);
     if (ui::button("##FavoriteFolder", ui::Icon::Star,
@@ -3057,7 +3414,7 @@ void App::renderFavoritesBar(FilePanel& panel, PanelSide side) {
         shortcuts.push_back({f.label.empty()?favoriteLabelForPath(f.path,f.isAndroid):f.label,f.path,i});
     }
     if (!panel.isAndroid) {
-        for (const auto& drive:getWindowsDrives()) shortcuts.push_back({drive,drive+"\\"});
+        for (const auto& drive:getWindowsDrives()) shortcuts.push_back({drive, drive});
     } else {
         int slot=panel.deviceSlot;
         std::string root=deviceSession(slot).storageRoot.empty()?"/sdcard":deviceSession(slot).storageRoot;
@@ -3099,7 +3456,7 @@ void App::renderFavoritesBar(FilePanel& panel, PanelSide side) {
 std::string App::compareEntryPath(const FilePanel& panel, int index) const {
     if (panel.isApps) return panel.entryName(index);
     std::string path = panel.currentPath;
-    char sep = panel.isAndroid ? '/' : '\\';
+    char sep = pathSeparatorFor(panel.isAndroid);
     appendPathSeparator(path, sep);
     path += panel.entryName(index);
     return path;
@@ -3513,6 +3870,7 @@ void App::renderDeviceBar() {
                 if (ImGui::Checkbox("Keep Awake##devbar", &keepAwake)) {
                     std::string serial = devSnap[selSnap].serial;
                     std::string adbPath = m_device.getAdbPath();
+#if defined(_WIN32)
                     if (keepAwake && !m_keepAwake) {
                         // Spawn a background adb shell that holds a wakelock
                         // When the process dies (disconnect, app close), the lock auto-releases
@@ -3560,6 +3918,51 @@ void App::renderDeviceBar() {
                             m_statusTime = std::chrono::steady_clock::now();
                         });
                     }
+#else
+                    if (keepAwake && !m_keepAwake) {
+                        // Spawn a background adb shell holding a wakelock; it
+                        // auto-releases when this process dies (pid orphaned ->
+                        // adb's cat blocks forever until adb kills it, and
+                        // wake_unlock runs on the shell's exit trap).
+                        std::string serial = devSnap[selSnap].serial;
+                        std::string adbPath = m_device.getAdbPath();
+                        pid_t pid = ::fork();
+                        if (pid == 0) {
+                            ::setsid();
+                            const int devnull = ::open("/dev/null", O_WRONLY);
+                            if (devnull >= 0) { ::dup2(devnull, 0); ::dup2(devnull, 1); ::dup2(devnull, 2); }
+                            ::execlp(adbPath.c_str(), adbPath.c_str(), "-s", serial.c_str(),
+                                     "shell",
+                                     "echo afm_keepawake > /sys/power/wake_lock 2>/dev/null; cat > /dev/null",
+                                     static_cast<char*>(nullptr));
+                            _exit(127);
+                        }
+                        if (pid > 0) {
+                            m_wakeLockProcess = reinterpret_cast<void*>(static_cast<intptr_t>(pid));
+                            m_keepAwake = true;
+                            m_statusMessage = "Keep awake enabled (wakelock)";
+                            m_statusTime = std::chrono::steady_clock::now();
+                        } else {
+                            m_device.runAdbCommand("-s " + serial + " shell svc power stayon usb");
+                            m_keepAwake = true;
+                            m_statusMessage = "Keep awake enabled";
+                            m_statusTime = std::chrono::steady_clock::now();
+                        }
+                    } else if (!keepAwake && m_keepAwake) {
+                        if (m_wakeLockProcess) {
+                            const pid_t pid = static_cast<pid_t>(reinterpret_cast<intptr_t>(m_wakeLockProcess));
+                            ::kill(pid, SIGKILL);       // releases the wakelock below
+                            ::waitpid(pid, nullptr, 0); // reap
+                            m_wakeLockProcess = nullptr;
+                        }
+                        m_keepAwake = false;
+                        postAsync("Disabling keep awake...", [this, serial]() {
+                            m_device.runAdbCommand("-s " + serial + " shell \"echo afm_keepawake > /sys/power/wake_unlock 2>/dev/null; svc power stayon false 2>/dev/null\"");
+                            m_statusMessage = "Keep awake disabled";
+                            m_statusTime = std::chrono::steady_clock::now();
+                        });
+                    }
+#endif
                 }
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Prevent the device from sleeping while connected.\nUses a wakelock that auto-releases if the connection drops.");
@@ -3580,8 +3983,14 @@ void App::renderDeviceBar() {
                         std::string serial = devSnap[selSnap].serial;
                         // Kill wakelock process if active (will auto-release on device)
                         if (m_keepAwake && m_wakeLockProcess) {
+#if defined(_WIN32)
                             TerminateProcess(m_wakeLockProcess, 0);
                             CloseHandle(m_wakeLockProcess);
+#else
+                            const pid_t wlPid = static_cast<pid_t>(reinterpret_cast<intptr_t>(m_wakeLockProcess));
+                            ::kill(wlPid, SIGKILL);
+                            ::waitpid(wlPid, nullptr, 0);
+#endif
                             m_wakeLockProcess = nullptr;
                             m_keepAwake = false;
                         }
@@ -3680,8 +4089,10 @@ void App::renderConnectionActivity() {
             card.stage = client.statusText();
             if (card.stage.empty()) card.stage = "Preparing device connection";
         } else if (card.retrying) {
-            auto seconds = std::max(1LL, std::chrono::duration_cast<std::chrono::seconds>(
-                deviceSession(card.slot).retryAfter - now).count() + 1);
+            const auto retrySeconds =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    deviceSession(card.slot).retryAfter - now).count() + 1;
+            auto seconds = std::max<int64_t>(1, retrySeconds);
             card.stage = "Retrying in " + std::to_string(seconds) + " seconds";
         } else {
             card.stage = listedOnline ? "Waiting for device" : "Device disconnected";
@@ -3918,7 +4329,9 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         return;
     }
     const char* label = panel.isAndroid ? "Android" : "Windows";
-    ImVec4 labelColor = panel.isAndroid ? ImVec4(0.3f,0.85f,0.4f,1) : ImVec4(0.40f,0.65f,1,1);
+    (void)label;
+    [[maybe_unused]] const ImVec4 labelColor =
+        panel.isAndroid ? ImVec4(0.3f,0.85f,0.4f,1) : ImVec4(0.40f,0.65f,1,1);
 
     // The connection manager is a persistent pane mode. It is also used as the
     // setup fallback when an Android pane has no connected device.
@@ -4120,7 +4533,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
 
                 if (ImGui::IsMouseDoubleClicked(0)) {
                     if (isDir) {
-                        std::string sep = panel.isAndroid ? "/" : "\\";
+                        std::string sep(1, pathSeparatorFor(panel.isAndroid));
                         std::string np = panel.currentPath;
                         appendPathSeparator(np, sep[0]);
                         np += name;
@@ -4128,7 +4541,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                     } else if (endsWithCI(name, ".mcraw") && !panel.isAndroid) {
                         // Windows side: mount MCRAW via ProjFS and navigate to mount point
                         std::string mcrawFullPath = panel.currentPath;
-                        appendPathSeparator(mcrawFullPath, '\\');
+                        appendPathSeparator(mcrawFullPath, pathSeparatorFor(panel.isAndroid));
                         mcrawFullPath += name;
                         FilePanel* targetPanel = &panel;
                         postAsync("Mounting MCRAW...", [this, mcrawFullPath, targetPanel]() {
@@ -4153,12 +4566,21 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                         std::string vname = name;
                         std::string mcraw = panel.mcrawFilePath;
                         postAsync("Extracting " + vname + "...", [this, mcraw, vname]() {
+#if defined(_WIN32)
                             char tmpDir[MAX_PATH];
                             GetTempPathA(MAX_PATH, tmpDir);
                             std::string tmpPath = std::string(tmpDir) + vname;
+#else
+                            std::string tmpPath = (std::filesystem::temp_directory_path() / vname).string();
+#endif
                             uint64_t outSize = 0;
                             if (m_device.pullMcrawItem(mcraw, vname, tmpPath, outSize)) {
+#if defined(_WIN32)
                                 ShellExecuteA(nullptr, "open", tmpPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+                                std::string err;
+                                platform::shellOpen(tmpPath, err);
+#endif
                             } else {
                                 m_statusMessage = "Failed to extract " + vname;
                                 m_statusTime = std::chrono::steady_clock::now();
@@ -4172,8 +4594,13 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                         if (endsWithCI(name, ".apk"))
                             requestApkInstall(fp);
                         else {
+#if defined(_WIN32)
                             const std::wstring widePath = toWide(fp);
                             ShellExecuteW(nullptr, L"open", widePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+                            std::string err;
+                            platform::shellOpen(fp, err);
+#endif
                         }
                     } else {
                         // Double-clicked a file on Android side — pull to temp and open
@@ -4491,7 +4918,7 @@ void App::renderTransferOverlay() {
         while (s >= 1024.0 && i < 4) { s /= 1024.0; i++; }
 
         char buf[48];
-        if (i == 0) snprintf(buf, sizeof(buf), "%llu B", bytes);
+        if (i == 0) snprintf(buf, sizeof(buf), "%llu B", static_cast<unsigned long long>(bytes));
         else snprintf(buf, sizeof(buf), "%.*f %s", decimals, s, u[i]);
         return std::string(buf);
     };
@@ -4691,7 +5118,6 @@ void App::renderTransferOverlay() {
     ImGui::Spacing();
 
     // --- Control buttons ---
-    bool isRunning = (st == BatchState::Running);
     bool isPaused  = (st == BatchState::Paused);
     bool isDone    = (st == BatchState::Completed || st == BatchState::Failed || st == BatchState::Stopped);
     bool waitingRetry = batch->waitingForUserRetry.load();
@@ -5005,8 +5431,7 @@ void App::startAppUninstall(FilePanel& panel, bool useRoot) {
     prompt += std::to_string(apps.size()) + " selected app";
     if (apps.size() != 1) prompt += "s";
     prompt += " for the current Android user?";
-    if (MessageBoxA(g_mainHwnd, prompt.c_str(), useRoot ? "Confirm Root Uninstall" : "Confirm Uninstall",
-                    MB_YESNO | MB_ICONWARNING) != IDYES)
+    if (!confirmBox(useRoot ? "Confirm Root Uninstall" : "Confirm Uninstall", prompt))
         return;
 
     int slot = panel.deviceSlot;
@@ -5113,6 +5538,7 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
     std::string sideId = side == PanelSide::Left ? "L" : "R";
     const float s=ui::scale();
     if(ui::button("Install APK",ui::Icon::Plus,ui::Appearance::Primary)) {
+#if defined(_WIN32)
         wchar_t path[32768] = {};
         OPENFILENAMEW dialog = {};
         dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=g_mainHwnd;
@@ -5120,6 +5546,10 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
         dialog.lpstrFile=path;dialog.nMaxFile=(DWORD)std::size(path);
         dialog.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
         if(GetOpenFileNameW(&dialog))requestApkInstall(pathToUtf8(std::filesystem::path(path)));
+#else
+        pickFileViaZenity([this](const std::string& p) { requestApkInstall(p); },
+                          "Android packages (*.apk)|*.apk|All files|*");
+#endif
     }
     ImGui::SameLine(0,8*s);
     bool hasSelection=!panel.selectedIndices.empty();
@@ -5331,11 +5761,17 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
 }
 
 std::string App::getBackupsRootPath() const {
+#if defined(_WIN32)
     char exePath[MAX_PATH];
     DWORD len = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
     std::filesystem::path dir = (len > 0 && len < MAX_PATH)
         ? std::filesystem::path(exePath).parent_path()
         : std::filesystem::current_path();
+#else
+    std::error_code ec;
+    std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    std::filesystem::path dir = ec ? std::filesystem::current_path() : exe.parent_path();
+#endif
     return pathToUtf8(dir / "Backups");
 }
 
@@ -5391,7 +5827,10 @@ void App::refreshBackupManagerBackups() {
     if (std::filesystem::exists(jobsRoot, ec)) {
         for (auto jobIt = std::filesystem::directory_iterator(jobsRoot, ec);
              !ec && jobIt != std::filesystem::directory_iterator(); jobIt.increment(ec)) {
-            if (jobIt->is_regular_file(ec) && _wcsicmp(jobIt->path().extension().c_str(), L".zip") == 0) {
+            std::string extLower = jobIt->path().extension().string();
+            std::transform(extLower.begin(), extLower.end(), extLower.begin(),
+                           [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+            if (jobIt->is_regular_file(ec) && extLower == ".zip") {
                 BackupArchive archive;
                 std::string archiveError;
                 if (!archive.open(jobIt->path(), archiveError)) {
@@ -5641,15 +6080,21 @@ void App::openBackupManagerJob(const BackupManagerBackupRow& row) {
                 rec.hasMedia = meta["has"].value("media", false);
             }
             rec.sizeBytes = directorySizeBytes(bakIt->path());
-            if (!rec.packageName.empty()) m_backupManagerJobApps.push_back({ rec, false });
+            if (!rec.packageName.empty()) {
+                BackupManagerJobAppRow jobRow{};
+                jobRow.record = rec;
+                m_backupManagerJobApps.push_back(std::move(jobRow));
+            }
         }
     }
     std::sort(m_backupManagerJobApps.begin(), m_backupManagerJobApps.end(), [](const BackupManagerJobAppRow& a, const BackupManagerJobAppRow& b) {
         return _stricmp(a.record.packageName.c_str(), b.record.packageName.c_str()) < 0;
     });
 
-    if (!row.isJob && m_backupManagerJobApps.empty()) {
-        m_backupManagerJobApps.push_back({ row.record, false });
+    if (m_backupManagerJobApps.empty()) {
+        BackupManagerJobAppRow jobRow{};
+        jobRow.record = row.record;
+        m_backupManagerJobApps.push_back(std::move(jobRow));
     }
 }
 
@@ -5851,7 +6296,7 @@ void App::startBackupManagerBackup() {
     if (packages.empty()) return;
     LOG_INFO("BackupManager", "Backup requested for " + std::to_string(packages.size()) + " package(s)");
     std::string prompt = "Back up " + std::to_string(packages.size()) + " selected app(s) to the PC?";
-    if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Backup", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    if (!confirmBox("Confirm Backup", prompt)) return;
 
     std::string serial = deviceSession(slot).serial;
     std::string adbPath = deviceForSlot(slot).getAdbPath();
@@ -6023,8 +6468,10 @@ void App::startBackupManagerBackup() {
             }
 
             const std::filesystem::path archivePath = toFsPath(jobPath).parent_path() /
-                (toFsPath(created).wstring() + L".zip");
-            const std::filesystem::path temporaryArchivePath = archivePath.wstring() + L".tmp";
+                (toFsPath(created).string() + ".zip");
+            const std::filesystem::path temporaryArchivePath =
+                archivePath.string() + ".tmp";
+#if defined(_WIN32)
             HANDLE seed = CreateFileW(temporaryArchivePath.c_str(), GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
             bool downloadOk = seed != INVALID_HANDLE_VALUE;
@@ -6034,6 +6481,18 @@ void App::startBackupManagerBackup() {
                 downloadOk = SetFilePointerEx(seed, size, nullptr, FILE_BEGIN) && SetEndOfFile(seed);
                 CloseHandle(seed);
             }
+#else
+            bool downloadOk = true;
+            {
+                const int seedFd = ::open(temporaryArchivePath.c_str(),
+                                          O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                downloadOk = seedFd >= 0;
+                if (downloadOk) {
+                    downloadOk = ::ftruncate(seedFd, static_cast<off_t>(remoteArchiveSize)) == 0;
+                    ::close(seedFd);
+                }
+            }
+#endif
 
             auto archiveChannels = buildArchiveTransportChannels(slotClient, slot, 6040);
             std::vector<DeviceClient*> downloadWorkers;
@@ -6062,12 +6521,22 @@ void App::startBackupManagerBackup() {
             TransferRateEstimator transferRate;
             auto downloadWorker = [&](DeviceClient* client, size_t channelIndex) {
                 const auto channelStart = std::chrono::steady_clock::now();
+#if defined(_WIN32)
                 HANDLE output = CreateFileW(temporaryArchivePath.c_str(), GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (output == INVALID_HANDLE_VALUE) {
                     transferFailed = true;
                     return;
                 }
+#else
+                // pwrite() takes an explicit offset — no shared seek cursor,
+                // which is exactly what parallel stripes need.
+                const int output = ::open(temporaryArchivePath.c_str(), O_WRONLY);
+                if (output < 0) {
+                    transferFailed = true;
+                    return;
+                }
+#endif
                 while (!transferFailed.load()) {
                     {
                         std::unique_lock<std::mutex> lock(m_backupControlMutex);
@@ -6082,6 +6551,7 @@ void App::startBackupManagerBackup() {
                     uint64_t received = client->readRangeStreaming(remoteArchive, offset, length,
                         [&](const void* data, uint32_t byteCount, uint64_t chunkOffset) {
                             if (m_backupCancelRequested.load()) return false;
+#if defined(_WIN32)
                             LARGE_INTEGER position{};
                             position.QuadPart = (LONGLONG)chunkOffset;
                             DWORD written = 0;
@@ -6090,6 +6560,15 @@ void App::startBackupManagerBackup() {
                                 transferFailed = true;
                                 return false;
                             }
+#else
+                            // pwrite is atomic w.r.t. the shared file offset.
+                            const ssize_t written = ::pwrite(output, data, byteCount,
+                                static_cast<off_t>(chunkOffset));
+                            if (written != static_cast<ssize_t>(byteCount)) {
+                                transferFailed = true;
+                                return false;
+                            }
+#endif
                             channelBytes[channelIndex] += byteCount;
                             uint64_t total = downloadedBytes.fetch_add(byteCount) + byteCount;
                             const TransferRateSample rate = transferRate.update(total, remoteArchiveSize);
@@ -6109,8 +6588,13 @@ void App::startBackupManagerBackup() {
                         });
                     if (received != length && !m_backupCancelRequested.load()) transferFailed = true;
                 }
+#if defined(_WIN32)
                 FlushFileBuffers(output);
                 CloseHandle(output);
+#else
+                ::fsync(output);
+                ::close(output);
+#endif
                 channelSeconds[channelIndex] = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - channelStart).count();
             };
@@ -6345,7 +6829,7 @@ void App::startBackupManagerBackup() {
                 archiveMessage.backupProgressTotal = (int)packages.size();
                 archiveMessage.backupProgressStageLabel = "Creating indexed backup archive";
                 postUiMessage(std::move(archiveMessage));
-                const std::filesystem::path archivePath = toFsPath(jobPath).parent_path() / (toFsPath(created).wstring() + L".zip");
+                const std::filesystem::path archivePath = toFsPath(jobPath).parent_path() / (toFsPath(created).string() + ".zip");
                 std::string archiveError;
                 archiveOk = BackupArchive::createStore(toFsPath(jobPath), archivePath, archiveError);
                 if (archiveOk) {
@@ -6473,7 +6957,7 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
     if (backups.empty()) return;
     LOG_INFO("BackupManager", "Restore requested for " + std::to_string(backups.size()) + " backup(s)");
     std::string prompt = "Restore " + std::to_string(backups.size()) + " selected backup(s) to the selected device?";
-    if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Restore", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+    if (!confirmBox("Confirm Restore", prompt)) return;
 
     std::string serial = deviceSession(slot).serial;
     std::string adbPath = deviceForSlot(slot).getAdbPath();
@@ -6627,8 +7111,8 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
             }
 
             if (!archiveGroups.empty()) {
-                int restoredFromArchives = 0;
-                int failedFromArchives = 0;
+                [[maybe_unused]] int restoredFromArchives = 0;
+                [[maybe_unused]] int failedFromArchives = 0;
                 for (const auto& group : archiveGroups) {
                     if (m_backupCancelRequested.load()) break;
                     std::vector<std::string> prefixes;
@@ -6674,9 +7158,20 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                     if (restoreWholeArchive) {
                         LOG_INFO("BackupManager", "All archive apps selected, uploading the original backup directly");
                     } else {
+                        const uint64_t uniqueTag =
+#if defined(_WIN32)
+                            GetTickCount64();
+#else
+                            (uint64_t)std::chrono::system_clock::now().time_since_epoch().count();
+#endif
                         uploadArchive = std::filesystem::temp_directory_path() /
+#if defined(_WIN32)
                             (L"FastEnough-restore-selection-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
-                             std::to_wstring(GetTickCount64()) + L".zip");
+                             std::to_wstring(uniqueTag) + L".zip");
+#else
+                            ("FastEnough-restore-selection-" + std::to_string(::getpid()) + "-" +
+                             std::to_string(uniqueTag) + ".zip");
+#endif
                         if (!BackupArchive::createSelection(toFsPath(group.first), prefixes, uploadArchive, archiveError)) {
                             details += group.first + ": " + archiveError + "\n";
                             failedFromArchives += (int)group.second.size();
@@ -6687,7 +7182,12 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                     std::error_code sizeError;
                     uint64_t archiveSize = std::filesystem::file_size(uploadArchive, sizeError);
                     const std::string remoteArchive = "/data/local/tmp/afm-restore-job-" +
+#if defined(_WIN32)
                         std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + ".zip";
+#else
+                        std::to_string(::getpid()) + "-" +
+                        std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + ".zip";
+#endif
                     if (sizeError || !restoreWorkClient.createFile(remoteArchive, archiveSize)) {
                         details += group.first + ": Could not create the device restore archive: " +
                             restoreWorkClient.lastError() + "\n";
@@ -7153,8 +7653,15 @@ void App::renderBackupManagerWindow() {
     ui::tooltip(root.c_str());
     if (theme.button("##OpenBackupFolder", "Open Folder", ui::Icon::Folder,
         ImVec2(folderX, storageY), ImVec2(128 * s, 32 * s), theme.text)) {
+#if defined(_WIN32)
         CreateDirectoryW(toWide(root).c_str(), nullptr);
         ShellExecuteW(nullptr, L"explore", toWide(root).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+        std::error_code mkEc;
+        std::filesystem::create_directories(root, mkEc);
+        std::string err;
+        platform::shellOpen(root, err);
+#endif
     }
     float deviceY = toolbar.y + titleRowH;
     ImGui::GetWindowDrawList()->AddLine(ImVec2(toolbar.x, deviceY - 6 * s), ImVec2(toolbar.x + width, deviceY - 6 * s), theme.color(theme.border));
@@ -7321,7 +7828,7 @@ void App::renderBackupManagerWindow() {
         std::string prompt = "Permanently delete " + std::to_string(paths.size()) + " selected backup job";
         if (paths.size() != 1) prompt += "s";
         prompt += " and all files inside?";
-        if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Delete Backup Jobs", MB_YESNO | MB_ICONWARNING) != IDYES)
+        if (!confirmBox("Delete Backup Jobs", prompt))
             return;
         std::string jobsRoot = pathToUtf8(toFsPath(getBackupsRootPath()) / "Jobs");
         postAsync("Deleting backup jobs...", [this, paths, jobsRoot]() {
@@ -7331,7 +7838,20 @@ void App::renderBackupManagerWindow() {
             for (const auto& value : paths) {
                 ec.clear();
                 std::filesystem::path target = std::filesystem::weakly_canonical(toFsPath(value), ec);
-                if (ec || _wcsicmp(target.parent_path().c_str(), allowed.c_str()) != 0) {
+                const std::string targetParent = pathToUtf8(target.parent_path());
+#if defined(_WIN32)
+                const bool outsideJobs = _wcsicmp(target.parent_path().c_str(), allowed.c_str()) != 0;
+#else
+                bool outsideJobs = ::strcasecmp(targetParent.c_str(), allowed.c_str()) != 0;
+                // /tmp-style symlink variance: also accept realpath equality.
+                if (outsideJobs) {
+                    std::error_code canEc;
+                    const std::filesystem::path realAllowed =
+                        std::filesystem::weakly_canonical(toFsPath(allowed), canEc);
+                    outsideJobs = canEc || targetParent != pathToUtf8(realAllowed);
+                }
+#endif
+                if (ec || outsideJobs) {
                     LOG_ERROR("BackupManager", "Refused to delete backup outside the Jobs folder: " + value);
                     continue;
                 }
@@ -8056,10 +8576,16 @@ void App::openAndroidFile(FilePanel& panel, int index) {
 
     int slot = panel.deviceSlot;
     postAsync("Opening: " + name, [this, remotePath, name, slot]() {
+#if defined(_WIN32)
         char tempBuf[MAX_PATH];
         GetTempPathA(MAX_PATH, tempBuf);
         std::string tempDir = std::string(tempBuf) + "FastEnough\\";
         CreateDirectoryA(tempDir.c_str(), nullptr);
+#else
+        std::string tempDir = (std::filesystem::temp_directory_path() / "FastEnough" / "").string();
+        std::error_code mkEc;
+        std::filesystem::create_directories(tempDir, mkEc);
+#endif
 
         std::string localPath = tempDir + name;
         uint64_t outSize = 0;
@@ -8068,6 +8594,7 @@ void App::openAndroidFile(FilePanel& panel, int index) {
         bool ok = deviceForSlot(slot).pullFile(remotePath, localPath, outSize, nullptr);
         if (ok) {
             LOG_INFO("UI", "Opening: " + localPath);
+#if defined(_WIN32)
             const std::wstring wideLocalPath = toWide(localPath);
             HINSTANCE launchResult = ShellExecuteW(
                 nullptr, L"open", wideLocalPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -8079,6 +8606,15 @@ void App::openAndroidFile(FilePanel& panel, int index) {
                     std::to_string(reinterpret_cast<INT_PTR>(launchResult)) + ")");
                 m_statusMessage = "Failed to open: " + name;
             }
+#else
+            std::string openErr;
+            if (platform::shellOpen(localPath, openErr)) {
+                m_statusMessage = "Opened: " + name;
+            } else {
+                LOG_ERROR("UI", "Failed to launch file: " + localPath + " (" + openErr + ")");
+                m_statusMessage = "Failed to open: " + name;
+            }
+#endif
         } else {
             LOG_ERROR("UI", "Failed to pull file: " + remotePath);
             m_statusMessage = "Failed to open: " + name;
@@ -8887,6 +9423,7 @@ void App::renderApkInstallDialog() {
     }
 }
 
+#if defined(_WIN32)
 void App::registerApkAssociation() {
     char exePath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -8944,6 +9481,54 @@ void App::registerApkAssociation() {
     ShellExecuteA(nullptr, "open", "ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+#else
+void App::registerApkAssociation() {
+    // Linux: install a .desktop entry so APK files can be opened with us.
+    // Writes to XDG_DATA_HOME (user scope), then refreshes the MIME database.
+    const char* xdgData = ::getenv("XDG_DATA_HOME");
+    std::string dataHome;
+    if (xdgData && *xdgData) {
+        dataHome = xdgData;
+    } else if (const char* home = ::getenv("HOME")) {
+        dataHome = std::string(home) + "/.local/share";
+    }
+    if (dataHome.empty()) return;
+    std::error_code ec;
+    const std::filesystem::path appsDir = std::filesystem::path(dataHome) / "applications";
+    std::filesystem::create_directories(appsDir, ec);
+    if (ec) return;
+    std::error_code exeEc;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", exeEc);
+    if (exeEc) return;
+    // Quote/escape the executable for the desktop-entry Exec key (the path may
+    // contain spaces; `"`, `\`, backtick and `$` are the reserved characters).
+    std::string execQuoted;
+    for (char c : exe.string()) {
+        if (c == '"' || c == '\\' || c == '`' || c == '$') execQuoted += '\\';
+        execQuoted += c;
+    }
+    const std::string desktop =
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Fast Enough Android File Manager\n"
+        "Exec=\"" + execQuoted + "\" %f\n"
+        "Icon=fast-enough\n"
+        "StartupWMClass=fast-enough\n"
+        "NoDisplay=true\n"
+        "MimeType=application/vnd.android.package-archive;\n";
+    std::ofstream f(appsDir / "fastenough-apk.desktop", std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    f << desktop;
+    f.close();
+    platform::refreshDesktopDatabase(appsDir.string());
+    showNotification("APK Handler Registered",
+        "Fast Enough was added as an APK handler.\n\n"
+        "If APK files open with another app by default, right-click an APK, choose "
+        "Open With, then select Fast Enough Android File Manager.", false);
+}
+
+#endif
+
 void App::renderCloseConfirmDialog() {
     if (m_showCloseConfirm) {
         ImGui::OpenPopup("Close Application?");
@@ -8964,7 +9549,9 @@ void App::renderCloseConfirmDialog() {
 
         if (modernButton("Yes", ImVec2(buttonWidth, 0))) {
             g_reallyQuit = true;
+#if defined(_WIN32)
             PostMessage(g_mainHwnd, WM_CLOSE, 0, 0);
+#endif
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
@@ -9204,7 +9791,7 @@ void App::renderNicConfigWindow() {
                 else if (nic.speed >= 1000000ULL)
                     ImGui::Text("%.0f Mbps", nic.speed / 1e6);
                 else if (nic.speed > 0)
-                    ImGui::Text("%llu bps", nic.speed);
+                    ImGui::Text("%llu bps", static_cast<unsigned long long>(nic.speed));
                 else
                     ImGui::TextDisabled("?");
 
@@ -9335,9 +9922,13 @@ void App::applyScale(float newScale) {
     fontCfg.PixelSnapH = true;
     fontCfg.RasterizerDensity = 1.0f;
 
+#if defined(_WIN32)
     char winDir[MAX_PATH];
     GetWindowsDirectoryA(winDir, MAX_PATH);
     std::string segoeUIPath = std::string(winDir) + "\\Fonts\\segoeui.ttf";
+#else
+    std::string segoeUIPath;  // resolved below from fontconfig candidates
+#endif
 
     // Include Latin, Latin Extended, Greek, Cyrillic, and common symbols
     // so non-ASCII folder/file names display correctly.
@@ -9351,6 +9942,7 @@ void App::applyScale(float newScale) {
         0,
     };
 
+#if defined(_WIN32)
     ImFont* mainFont = nullptr;
     if (GetFileAttributesA(segoeUIPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
         mainFont = io.Fonts->AddFontFromFileTTF(segoeUIPath.c_str(), fontSize, &fontCfg, glyphRanges);
@@ -9362,15 +9954,53 @@ void App::applyScale(float newScale) {
 
     std::string semiboldPath=std::string(winDir)+"\\Fonts\\seguisb.ttf";
     ui::semiboldFont=io.Fonts->AddFontFromFileTTF(semiboldPath.c_str(),fontSize,&fontCfg,glyphRanges);
+#else
+    // fontconfig-resolved candidates (regular + semibold)
+    std::string fontPath, semiboldPath;
+    {
+        auto queryFont = [](const char* pattern) -> std::string {
+            std::string cmd = std::string("fc-match -f '%{file}' ") + pattern + " 2>/dev/null";
+            FILE* pipe = ::popen(cmd.c_str(), "r");
+            if (!pipe) return "";
+            char buf[512] = {};
+            const size_t n = ::fread(buf, 1, sizeof(buf) - 1, pipe);
+            ::pclose(pipe);
+            std::string out(buf, n);
+            while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+            return out;
+        };
+        fontPath = queryFont("sans-serif:lang=en");
+        semiboldPath = queryFont("sans-serif:weight=demibold:lang=en");
+    }
+    ImFont* mainFont = nullptr;
+    if (!fontPath.empty())
+        mainFont = io.Fonts->AddFontFromFileTTF(fontPath.c_str(), fontSize, &fontCfg, glyphRanges);
+    if (!mainFont) {
+        fontCfg.SizePixels = fontSize;
+        mainFont = io.Fonts->AddFontDefault(&fontCfg);
+    }
+    ui::semiboldFont = semiboldPath.empty()
+        ? nullptr
+        : io.Fonts->AddFontFromFileTTF(semiboldPath.c_str(), fontSize, &fontCfg, glyphRanges);
+#endif
     if(!ui::semiboldFont)ui::semiboldFont=mainFont;
-    ui::connectionHeadingFont=io.Fonts->AddFontFromFileTTF(semiboldPath.c_str(),fontSize*29.0f/14.0f,&fontCfg,glyphRanges);
+    ui::connectionHeadingFont = semiboldPath.empty()
+        ? nullptr
+        : io.Fonts->AddFontFromFileTTF(semiboldPath.c_str(),fontSize*29.0f/14.0f,&fontCfg,glyphRanges);
     if(!ui::connectionHeadingFont)ui::connectionHeadingFont=ui::semiboldFont;
 
     io.Fonts->Build();
 
+#if defined(_WIN32)
     // Tell DX11 backend to rebuild font texture
     extern void ImGui_ImplDX11_InvalidateDeviceObjects();
     ImGui_ImplDX11_InvalidateDeviceObjects();
+#elif defined(__linux__)
+    // Drop the old OpenGL font texture; NewFrame recreates it from the
+    // freshly built atlas (same role as the DX11 invalidate above).
+    extern bool ImGui_ImplOpenGL3_DestroyDeviceObjects();
+    ImGui_ImplOpenGL3_DestroyDeviceObjects();
+#endif
 
     // Save current colors before resetting style
     ImVec4 savedColors[ImGuiCol_COUNT];
@@ -9494,7 +10124,8 @@ void App::renderThemeWindow() {
 
     // Discrete 5% steps: index 0=50%, 1=55%, ..., 50=300%
     int step = ((int)(m_scalePreview * 100.0f + 0.5f) - 50) / 5;
-    if (step < 0) step = 0; if (step > 50) step = 50;
+    if (step < 0) step = 0;
+    if (step > 50) step = 50;
     ImGui::SetNextItemWidth(250);
     char stepLabel[16]; snprintf(stepLabel, sizeof(stepLabel), "%d%%%%", step * 5 + 50);
     if (ImGui::SliderInt("App Scale", &step, 0, 50, stepLabel)) {
@@ -9683,6 +10314,7 @@ void App::renderDebugWindow() {
     if(ui::button("Copy visible",ui::Icon::Copy,ui::Appearance::Secondary))ImGui::SetClipboardText(exportText().c_str());
     ImGui::SameLine(0,8*s);
     if(ui::button("Export visible",ui::Icon::File,ui::Appearance::Secondary)) {
+#if defined(_WIN32)
         wchar_t path[32768]=L"FastEnough-activity.txt";
         OPENFILENAMEW dialog{};
         dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=g_mainHwnd;
@@ -9695,12 +10327,26 @@ void App::renderDebugWindow() {
             if(!output)showNotification("Export failed","Could not write the log to the selected location.",true);
             else LOG_INFO("Activity","Exported activity log: "+pathToUtf8(std::filesystem::path(path)));
         }
+#else
+        pickSaveFileViaZenity([this, exportText](const std::string& p) {
+            std::ofstream output(p, std::ios::binary);
+            output << exportText(); output.close();
+            if (!output) showNotification("Export failed", "Could not write the log to the selected location.", true);
+            else LOG_INFO("Activity", "Exported activity log: " + p);
+        }, "FastEnough-activity.txt");
+#endif
     }
     ImGui::SameLine(0,8*s);
     if(ui::button("Log folder",ui::Icon::Folder,ui::Appearance::Secondary)) {
         auto folder=toFsPath(logger.filePath()).parent_path();
+#if defined(_WIN32)
         auto result=ShellExecuteW(g_mainHwnd,L"explore",folder.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
         if((INT_PTR)result<=32)LOG_ERROR("Activity","Cannot open log folder, ShellExecute error "+std::to_string((INT_PTR)result));
+#else
+        std::string err;
+        if(!platform::shellOpen(folder.string(), err))
+            LOG_ERROR("Activity","Cannot open log folder: "+err);
+#endif
     }
     ImGui::SameLine(0,8*s);
     if(ui::button("Clear view",ui::Icon::Trash,ui::Appearance::Quiet))logger.clear();
@@ -9762,7 +10408,7 @@ void App::renderContextMenu(FilePanel& panel) {
             ImGui::Separator();
             if (ImGui::MenuItem("Open / Navigate")) {
                 if (panel.entryIsDir(m_contextIndex)) {
-                    std::string sep = panel.isAndroid ? "/" : "\\";
+                    std::string sep(1, pathSeparatorFor(panel.isAndroid));
                     std::string np = panel.currentPath;
                     appendPathSeparator(np, sep[0]); np += name;
                     navigateToDirectory(panel, np);
@@ -9772,13 +10418,18 @@ void App::renderContextMenu(FilePanel& panel) {
                 if (ImGui::MenuItem("Open with Default App")) {
                     std::string fp = panel.currentPath;
                     appendPathSeparator(fp, '\\'); fp += name;
+#if defined(_WIN32)
                     ShellExecuteA(nullptr, "open", fp.c_str(), nullptr, nullptr, SW_SHOW);
+#else
+                    std::string err;
+                    platform::shellOpen(fp, err);
+#endif
                 }
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Copy", "Ctrl+C")) {
                 m_clipboardPaths.clear();
-                std::string sep = panel.isAndroid ? "/" : "\\";
+                std::string sep(1, pathSeparatorFor(panel.isAndroid));
                 for (int idx : panel.selectedIndices) {
                     if (!panel.validIndex(idx)) continue;
                     std::string p = panel.currentPath;
@@ -9792,7 +10443,7 @@ void App::renderContextMenu(FilePanel& panel) {
             }
             if (ImGui::MenuItem("Cut", "Ctrl+X")) {
                 m_clipboardPaths.clear();
-                std::string sep = panel.isAndroid ? "/" : "\\";
+                std::string sep(1, pathSeparatorFor(panel.isAndroid));
                 for (int idx : panel.selectedIndices) {
                     if (!panel.validIndex(idx)) continue;
                     std::string p = panel.currentPath;
@@ -9814,6 +10465,15 @@ void App::renderContextMenu(FilePanel& panel) {
             if (ImGui::MenuItem("Copy to Other Panel")) {
                 if (&panel == &m_leftPanel) startTransfer(false); else startTransfer(true);
             }
+#if !defined(_WIN32)
+            // Drag-out fallback: Windows streams OLE virtual files; Linux has no
+            // portable drag-source API, so pull directly into a chosen folder.
+            if (panel.isAndroid && ImGui::MenuItem("Export to Folder...")) {
+                pickFolderViaZenity([this, &panel](const std::string& dir) {
+                    exportSelectionToFolder(panel, dir);
+                }, "Export selected items to folder");
+            }
+#endif
             ImGui::Separator();
             if (ImGui::MenuItem("Rename...")) { strcpy_s(m_renameBuf, name.c_str()); m_showRenamePopup = true; }
             if (ImGui::MenuItem("Delete", "Del")) {
@@ -9953,7 +10613,7 @@ void App::renderDeleteConfirmPopup() {
                 ImGui::Text("PERMANENTLY DELETE - This cannot be undone!");
                 ImGui::PopStyleColor();
             } else {
-                ImGui::TextColored(ImVec4(0.5f, 0.7f, 1, 1), "Move to Recycle Bin:");
+                ImGui::TextColored(ImVec4(0.5f, 0.7f, 1, 1), "Move to %s:", kTrashName);
             }
             ImGui::Spacing();
 
@@ -9973,8 +10633,10 @@ void App::renderDeleteConfirmPopup() {
 
             ImGui::Spacing();
             if (selCount > 1) {
-                ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "%d items will be %s",
-                    selCount, (m_deletePermanent || isAndroid) ? "permanently deleted" : "moved to Recycle Bin");
+                if (m_deletePermanent || isAndroid)
+                    ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "%d items will be permanently deleted", selCount);
+                else
+                    ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "%d items will be moved to %s", selCount, kTrashName);
                 ImGui::Spacing();
             }
 
@@ -9987,7 +10649,7 @@ void App::renderDeleteConfirmPopup() {
             // Delete button
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.2f, 0.2f, 1));
-            const char* btnLabel = (m_deletePermanent || isAndroid) ? "Delete Permanently" : "Move to Recycle Bin";
+            const char* btnLabel = (m_deletePermanent || isAndroid) ? "Delete Permanently" : kMoveToTrashLabel.c_str();
             if (modernButton(btnLabel, ImVec2(180, 0))) {
                 if (isAndroid) {
                     // Android: always permanent via server, refresh after the queued work finishes.
@@ -10139,7 +10801,7 @@ void App::refreshWindowsPanel(FilePanel& panel) {
     std::string mountPoint;
     if (isOwnMountedDevicePath(panel.currentPath, &mountPoint)) {
         std::string blockedPath = panel.currentPath;
-        panel.currentPath = "C:\\";
+        panel.currentPath = defaultLocalRoot();
         strcpy_s(panel.pathInput, panel.currentPath.c_str());
         panel.navHistory.erase(std::remove_if(panel.navHistory.begin(), panel.navHistory.end(),
             [this](const std::string& value) { return isOwnMountedDevicePath(value); }), panel.navHistory.end());
@@ -10170,8 +10832,13 @@ void App::refreshWindowsPanel(FilePanel& panel) {
             std::error_code ec;
             fe.isDirectory = entry.is_directory(ec);
             if (ec) fe.isDirectory = false;
+#if defined(_WIN32)
             DWORD attrs = GetFileAttributesW(entry.path().wstring().c_str());
             fe.isHidden = (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_HIDDEN);
+#else
+            // Dotfile convention for hidden files on Linux.
+            fe.isHidden = !fe.name.empty() && fe.name[0] == '.';
+#endif
             if (!fe.isDirectory) {
                 ec.clear();
                 fe.size = entry.file_size(ec);
@@ -10182,7 +10849,7 @@ void App::refreshWindowsPanel(FilePanel& panel) {
                 auto sc = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
                     ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
                 auto t = std::chrono::system_clock::to_time_t(sc);
-                struct tm tm; localtime_s(&tm, &t);
+                struct tm tm; localTimeSafe(&tm, &t);
                 char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm);
                 fe.dateModified = buf;
             } catch (...) { fe.dateModified = ""; }
@@ -10288,9 +10955,15 @@ void App::navigateToDirectory(FilePanel& panel, const std::string& path) {
         if (path == pathToUtf8(mcrawParent) || !pathToUtf8(curPath).starts_with(pathToUtf8(mcrawParent))) {
             // Check if we're still inside the mount point (ProjFS path won't contain the mcraw parent)
             // Simple heuristic: if path doesn't start with temp dir, we've left the mount
+#if defined(_WIN32)
             char tmpDir[MAX_PATH]; GetTempPathA(MAX_PATH, tmpDir);
             std::string tempBase(tmpDir);
             bool inMountPath = (path.find(tempBase) == 0 || path.find("McrawMount") != std::string::npos);
+#else
+            // The Linux FUSE mount lives under XDG_RUNTIME_DIR, not /tmp.
+            // Ask the mount manager instead of guessing from the path.
+            bool inMountPath = McrawMountManager::instance().isInsideMount(path);
+#endif
             if (!inMountPath) {
                 // Unmount the ProjFS mount when leaving the MCRAW
                 McrawMountManager::instance().unmountAll();
@@ -10304,18 +10977,35 @@ void App::navigateToDirectory(FilePanel& panel, const std::string& path) {
 }
 
 bool App::isOwnMountedDevicePath(const std::string& path, std::string* mountPoint) const {
+#if defined(_WIN32)
     if (path.size() < 2 || path[1] != ':') return false;
     char pathDrive = (char)std::toupper((unsigned char)path[0]);
     for (int slot = 0; slot < deviceSessionCount(); ++slot) {
         const auto& manager = DeviceMountManager::instance(slot);
         if (!manager.isMounted()) continue;
-        const std::string& mounted = manager.mountPoint();
+        const std::string mounted = manager.mountPoint();
         if (mounted.size() < 2 || mounted[1] != ':') continue;
         if (pathDrive != (char)std::toupper((unsigned char)mounted[0])) continue;
         if (mountPoint) *mountPoint = mounted;
         return true;
     }
     return false;
+#else
+    for (int slot = 0; slot < deviceSessionCount(); ++slot) {
+        const auto& manager = DeviceMountManager::instance(slot);
+        if (!manager.isMounted()) continue;
+        const std::string mounted = manager.mountPoint();
+        if (mounted.empty()) continue;
+        const bool exact = path == mounted;
+        const bool child = path.size() > mounted.size() &&
+                           path.compare(0, mounted.size(), mounted) == 0 &&
+                           (mounted.back() == '/' || path[mounted.size()] == '/');
+        if (!exact && !child) continue;
+        if (mountPoint) *mountPoint = mounted;
+        return true;
+    }
+    return false;
+#endif
 }
 
 void App::switchPanelMode(FilePanel& panel, bool toAndroid) {
@@ -10359,7 +11049,7 @@ void App::switchPanelMode(FilePanel& panel, bool toAndroid) {
     } else {
         panel.androidEntries.clear();
         panel.appEntries.clear();
-        panel.currentPath = "C:\\";
+        panel.currentPath = defaultLocalRoot();
         strcpy_s(panel.pathInput, panel.currentPath.c_str());
         panel.needsRefresh = true;
     }
@@ -10896,13 +11586,11 @@ void App::devicePollLoop() {
 
                 // Check if this WiFi device is online or offline
                 bool isOnline = false;
-                bool isOffline = false;
                 {
                     std::lock_guard<std::mutex> lk(m_deviceMutex);
                     for (auto& d : m_devices) {
                         if (d.serial == connectAddr) {
                             if (d.state == "device") isOnline = true;
-                            else isOffline = true; // "offline", "unauthorized", etc.
                             break;
                         }
                     }
@@ -10911,6 +11599,7 @@ void App::devicePollLoop() {
                 // If offline or not in list at all, try to reconnect
                 // Quick TCP probe first (1s timeout) to avoid 21s adb connect timeout
                 if (!isOnline) {
+#if defined(_WIN32)
                     SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                     if (probe != INVALID_SOCKET) {
                         unsigned long nonBlock = 1;
@@ -10924,6 +11613,10 @@ void App::devicePollLoop() {
                         closesocket(probe);
                         if (sel <= 0) continue; // not reachable, skip adb connect
                     }
+#else
+                    if (!platform::tcpProbe(w.wifiIp, w.port))
+                        continue; // not reachable, skip adb connect
+#endif
 
                     LOG_DEBUG("Poll", "WiFi device reachable, trying adb connect: " + connectAddr);
                     std::string result = m_device.runAdbCommand("connect " + connectAddr);
@@ -10979,21 +11672,30 @@ void App::devicePollLoop() {
             // track-devices connected — receive instant updates
             LOG_INFO("Poll", "Using ADB track-devices (instant notifications)");
 
+#if defined(_WIN32)
             // Set a timeout on the tracking socket so we can periodically check for shutdown
             // and run health checks
             DWORD trackTimeout = 10000; // 10s — wake up periodically for health checks
             setsockopt((SOCKET)trackSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&trackTimeout, sizeof(trackTimeout));
+#endif
 
             AdbDeviceSnapshot snapshot;
             while (!m_shutdownPoll) {
                 bool receivedUpdate = false;
                 auto devices = m_device.readTrackDevicesUpdate(trackSock, &receivedUpdate);
+#if defined(_WIN32)
                 int err = WSAGetLastError();
+                const bool waitTimedOut = (err == WSAETIMEDOUT);
+#else
+                // net::lastWaitTimedOut() mirrors WSAETIMEDOUT (set by the
+                // track socket's poll deadline inside readTrackDevicesUpdate).
+                const bool waitTimedOut = DeviceClient::lastTrackWaitTimedOut();
+#endif
                 if (receivedUpdate) {
                     if (snapshot.update(devices)) processDeviceUpdate(devices);
                     continue;
                 }
-                if (err == WSAETIMEDOUT) {
+                if (waitTimedOut) {
                     // An idle stream still needs periodic connection health checks.
                     // A busy worker owns the connections until its operation is complete.
                     std::unique_lock<std::mutex> healthCheck(m_deviceWorkMutex, std::try_to_lock);
@@ -11064,6 +11766,7 @@ void App::devicePollLoop() {
 
                                 // Quick TCP probe (1s timeout)
                                 bool reachable = false;
+#if defined(_WIN32)
                                 SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                                 if (probe != INVALID_SOCKET) {
                                     unsigned long nonBlock = 1;
@@ -11077,6 +11780,9 @@ void App::devicePollLoop() {
                                     closesocket(probe);
                                     reachable = (sel > 0);
                                 }
+#else
+                                reachable = platform::tcpProbe(w.wifiIp, w.port);
+#endif
 
                                 if (reachable) {
                                     LOG_INFO("Poll", "WiFi probe: " + connectAddr + " reachable, connecting...");
@@ -11107,7 +11813,11 @@ void App::devicePollLoop() {
 
                 if (devices.empty()) {
                     // Real connection error — fall out to reconnect
+#if defined(_WIN32)
                     LOG_WARN("Poll", "track-devices connection lost (WSA " + std::to_string(err) + ")");
+#else
+                    LOG_WARN("Poll", "track-devices connection lost");
+#endif
                     break;
                 }
 
@@ -11342,7 +12052,10 @@ static void addPullDirRecursive(DeviceClient& dev, const std::string& srcDir, co
         sub.isDirectory = e.isDirectory();
         sub.fileSize = e.size;
         sub.sourcePath = srcDir + "/" + e.name;
-        sub.destPath = dstDir + "\\" + e.name;
+        std::string childDest = dstDir;
+        appendPathSeparator(childDest, kLocalPathSeparator);
+        childDest += e.name;
+        sub.destPath = childDest;
         totalBytes += sub.fileSize;
         items.push_back(sub);
         if (sub.isDirectory)
@@ -11500,7 +12213,10 @@ static void addLocalDirRecursive(const std::string& srcDir, const std::string& d
         sub.isDirectory = entry.is_directory(ec);
         if (ec) sub.isDirectory = false;
         sub.sourcePath = pathToUtf8(entry.path());
-        sub.destPath = dstDir + "\\" + sub.displayName;
+        std::string childDest = dstDir;
+        appendPathSeparator(childDest, kLocalPathSeparator);
+        childDest += sub.displayName;
+        sub.destPath = childDest;
         if (!sub.isDirectory) {
             sub.fileSize = (uint64_t)entry.file_size(ec);
             if (ec) sub.fileSize = 0;
@@ -11619,6 +12335,7 @@ void App::queuePanelTransfer(FilePanel& src, FilePanel& dst, bool move) {
 
     if (localCopy) {
         std::error_code error;
+#if defined(_WIN32)
         auto destination=std::filesystem::weakly_canonical(toFsPath(dst.currentPath),error).wstring();
         if (!error) for (int index:src.selectedIndices) {
             if (!src.validIndex(index)) continue;
@@ -11630,6 +12347,19 @@ void App::queuePanelTransfer(FilePanel& src, FilePanel& dst, bool move) {
             bool insideSource=src.entryIsDir(index) && (_wcsicmp(source.c_str(),destination.c_str())==0 ||
                 (destination.size()>=prefix.size() && _wcsnicmp(prefix.c_str(),destination.c_str(),prefix.size())==0));
             if (sameFolder || insideSource) {
+#else
+        auto destination=std::filesystem::weakly_canonical(toFsPath(dst.currentPath),error).string();
+        if (!error) for (int index:src.selectedIndices) {
+            if (!src.validIndex(index)) continue;
+            auto source=std::filesystem::weakly_canonical(toFsPath(src.currentPath)/toFsPath(src.entryName(index)),error).string();
+            if (error) continue;
+            auto parent=std::filesystem::path(source).parent_path().string();
+            bool sameFolder=parent==destination;
+            std::string prefix=source+"/";
+            bool insideSource=src.entryIsDir(index) && (source==destination ||
+                (destination.size()>=prefix.size() && destination.compare(0, prefix.size(), prefix)==0));
+            if (sameFolder || insideSource) {
+#endif
                 showNotification("Choose another destination","Files cannot be copied or moved into their source folder or its descendants.",true);
                 return;
             }
@@ -11794,7 +12524,21 @@ void App::startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel) {
     queuePanelTransfer(srcPanel,dstPanel,false);
 }
 
+void App::exportSelectionToFolder(FilePanel& srcPanel, const std::string& destDir) {
+    if (!srcPanel.isAndroid || destDir.empty()) return;
+    // Reuse the normal transfer pipeline with a throwaway local destination
+    // panel, so overwrite handling, CRC verification and the progress dock are
+    // identical to a pull into the visible pane.
+    FilePanel dst;
+    dst.isAndroid = false;
+    dst.deviceSlot = 0;
+    dst.currentPath = destDir;
+    LOG_INFO("Transfer", "Export to folder: " + destDir);
+    queuePanelTransfer(srcPanel, dst, false);
+}
+
 void App::processBatchQueue() {
+#if defined(_WIN32)
     // Lower thread priority so transfers don't starve UI and other apps
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     // Set low I/O priority so disk reads don't evict other apps' cache
@@ -11803,6 +12547,10 @@ void App::processBatchQueue() {
     throttle.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
     throttle.StateMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
     SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttle, sizeof(throttle));
+#else
+    // Nice the transfer thread; I/O idle priority via ionice is a follow-up.
+    ::setpriority(PRIO_PROCESS, 0, 5);
+#endif
 
     while (!m_shutdownTransfer) {
         std::shared_ptr<TransferBatch> batch;
@@ -12338,7 +13086,13 @@ void App::processBatchQueue() {
             // Pre-create output files for split files (both channels write via OVERLAPPED)
             struct SplitFileHandle {
                 int fileIndex;
+#if defined(_WIN32)
                 HANDLE handle;
+                static HANDLE none() { return INVALID_HANDLE_VALUE; }
+#else
+                int handle;  // -1 = none
+                static int none() { return -1; }
+#endif
                 uint64_t fileSize;
             };
             std::vector<SplitFileHandle> splitHandles;
@@ -12387,6 +13141,7 @@ void App::processBatchQueue() {
                         // (directory batch items haven't been processed by workers yet)
                         try { std::filesystem::create_directories(std::filesystem::path(toFsPath(item.destPath)).parent_path()); } catch (...) {}
                         // Pre-create local output file
+#if defined(_WIN32)
                         HANDLE h = CreateFileW(toWide(item.destPath).c_str(), GENERIC_WRITE, FILE_SHARE_WRITE, nullptr,
                                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                         if (h != INVALID_HANDLE_VALUE) {
@@ -12395,10 +13150,23 @@ void App::processBatchQueue() {
                             SetEndOfFile(h);
                             splitHandles.push_back({i, h, item.fileSize});
                         }
+#else
+                        {
+                            const int fd = ::open(item.destPath.c_str(),
+                                                  O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                            if (fd >= 0) {
+                                if (::ftruncate(fd, static_cast<off_t>(item.fileSize)) != 0) {
+                                    LOG_WARN("Transfer", "Preallocation failed for " + item.destPath +
+                                             "; block writes will extend the file");
+                                }
+                                splitHandles.push_back({i, fd, item.fileSize});
+                            }
+                        }
+#endif
                     } else {
                         // Pre-create remote file on device with pre-allocation
                         batchDev.createFile(item.destPath, item.fileSize);
-                        splitHandles.push_back({i, INVALID_HANDLE_VALUE, item.fileSize});
+                        splitHandles.push_back({i, SplitFileHandle::none(), item.fileSize});
                     }
                     LOG_INFO("Transfer", "Splitting " + item.displayName + " (" + formatSize(item.fileSize) +
                              ") into " + std::to_string(blockCount) + " adaptive blocks");
@@ -12587,6 +13355,7 @@ void App::processBatchQueue() {
                                     }
                                     if (!ip.empty()) {
                                         // Quick TCP probe without disrupting current connection
+#if defined(_WIN32)
                                         SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                                         if (probe != INVALID_SOCKET) {
                                             u_long nonBlock = 1;
@@ -12602,6 +13371,10 @@ void App::processBatchQueue() {
                                             struct timeval tv = {1, 0}; // 1 second timeout
                                             bool reachable = (select((int)probe + 1, nullptr, &wset, nullptr, &tv) > 0);
                                             closesocket(probe);
+#else
+                                        const bool reachable = platform::tcpProbe(ip, dev.serverPort());
+                                        if (reachable) {
+#endif
                                             if (reachable) {
                                                 // WiFi is reachable, now switch for real
                                                 dev.disconnectTcp();
@@ -12615,7 +13388,6 @@ void App::processBatchQueue() {
                                     }
                                 }
                                 if (upgraded) {
-                                    bool wasUsb = currentIsUsb;
                                     currentIsUsb = origIsUsb;
                                     ch.speed = 0;
                                     lastSpeedBytes = ch.bytesTransferred.load();
@@ -12716,7 +13488,7 @@ void App::processBatchQueue() {
                         }
                     };
 
-                    auto progressCb = [&](uint64_t transferred, uint64_t total) -> bool {
+                    auto progressCb = [&](uint64_t transferred, uint64_t /*total*/) -> bool {
                         if (m_shutdownTransfer || batch->stopRequested.load()) return false;
                         while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
                             batch->state = BatchState::Paused;
@@ -12756,11 +13528,16 @@ void App::processBatchQueue() {
                     } else if (batch->isPull) {
                         // Pull block: read range from device, write to local file
                         uint32_t blockCrc = ~(uint32_t)0;
+#if defined(_WIN32)
                         HANDLE fh = INVALID_HANDLE_VALUE;
+#else
+                        int fh = -1;
+#endif
                         for (auto& sh : splitHandles)
                             if (sh.fileIndex == block.fileIndex) { fh = sh.handle; break; }
 
                         uint64_t blockReceived = 0;
+                        std::atomic<bool> localWriteFailed{false};
                         auto rangeCb = [&](const void* data, uint32_t len, uint64_t offset) -> bool {
                             if (m_shutdownTransfer || batch->stopRequested.load()) return false;
                             while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
@@ -12770,6 +13547,7 @@ void App::processBatchQueue() {
                             if (m_shutdownTransfer || batch->stopRequested.load()) return false;
                             batch->state = BatchState::Running;
                             crc32Update(blockCrc, data, len);
+#if defined(_WIN32)
                             if (fh != INVALID_HANDLE_VALUE) {
                                 OVERLAPPED ov = {};
                                 ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
@@ -12777,12 +13555,31 @@ void App::processBatchQueue() {
                                 DWORD written;
                                 WriteFile(fh, data, len, &written, &ov);
                             }
+#else
+                            if (fh >= 0 &&
+                                !localPwriteFully(fh, data, len, static_cast<off_t>(offset))) {
+                                localWriteFailed.store(true);
+                                return false;
+                            }
+#endif
                             blockReceived += len;
                             updateProgress(blockReceived);
                             return true;
                         };
 
                         uint64_t got = dev.readRangeStreaming(item.sourcePath, block.offset, block.length, rangeCb);
+                        if (localWriteFailed.load() && !batch->stopRequested.load()) {
+                            LOG_ERROR("Transfer", ch.channelName + " local write failed: " +
+                                      item.displayName + " - " + item.destPath);
+                            batch->state = BatchState::Failed;
+                            batch->errorMessage = "Failed to write to the local destination:\n" + item.destPath +
+                                "\n\nCheck free space and write permissions.";
+                            {
+                                std::lock_guard<std::mutex> lk(workMutex);
+                                workQueue.clear();
+                            }
+                            break;
+                        }
                         ok = (got >= block.length) || batch->stopRequested.load();
                         if (ok && !batch->stopRequested.load()) {
                             std::lock_guard<std::mutex> lk(crcMutex);
@@ -12798,6 +13595,7 @@ void App::processBatchQueue() {
                         // Compute block CRC from local file for verification (avoids re-reading later)
                         if (ok && !batch->stopRequested.load()) {
                             uint32_t blockCrc = ~(uint32_t)0;
+#if defined(_WIN32)
                             HANDLE hCrc = CreateFileW(toWide(item.sourcePath).c_str(), GENERIC_READ,
                                 FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
                             if (hCrc != INVALID_HANDLE_VALUE) {
@@ -12816,6 +13614,27 @@ void App::processBatchQueue() {
                                 std::lock_guard<std::mutex> lk(crcMutex);
                                 allBlockCrcs.push_back({block.blockId, block.offset, ~blockCrc, block.length, block.fileIndex});
                             }
+#else
+                            const int fd = ::open(item.sourcePath.c_str(), O_RDONLY);
+                            if (fd >= 0) {
+                                ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+                                char crcBuf[256 * 1024];
+                                uint64_t remaining = block.length;
+                                off_t pos = static_cast<off_t>(block.offset);
+                                while (remaining > 0) {
+                                    const size_t toRead =
+                                        static_cast<size_t>(std::min<uint64_t>(remaining, sizeof(crcBuf)));
+                                    const ssize_t bytesRead = ::pread(fd, crcBuf, toRead, pos);
+                                    if (bytesRead <= 0) break;
+                                    crc32Update(blockCrc, crcBuf, static_cast<size_t>(bytesRead));
+                                    remaining -= static_cast<uint64_t>(bytesRead);
+                                    pos += bytesRead;
+                                }
+                                ::close(fd);
+                                std::lock_guard<std::mutex> lk(crcMutex);
+                                allBlockCrcs.push_back({block.blockId, block.offset, ~blockCrc, block.length, block.fileIndex});
+                            }
+#endif
                         }
                     }
 
@@ -13049,7 +13868,11 @@ void App::processBatchQueue() {
 
             // Close all split file handles
             for (auto& sh : splitHandles) {
+#if defined(_WIN32)
                 if (sh.handle != INVALID_HANDLE_VALUE) CloseHandle(sh.handle);
+#else
+                if (sh.handle >= 0) ::close(sh.handle);
+#endif
             }
 
             uint64_t copiedBytes = 0;
@@ -13255,6 +14078,7 @@ void App::processBatchQueue() {
 
         auto buildCrossDeviceChannels = [&](DeviceClient& baseDev, int slot, int portBase,
                                             std::vector<RuntimeChannel>& out) {
+            (void)slot;  // identity comes from baseDev's session
             out.clear();
             if (!baseDev.isServerRunning()) return;
 
@@ -13442,7 +14266,7 @@ void App::processBatchQueue() {
             };
 
             static const uint64_t MB = 1024ULL * 1024;
-            static const uint64_t GB = 1024ULL * MB;
+            (void)MB;
             auto relayReadRangeSizeFor = [](uint64_t fileSize, int channels) -> uint64_t {
                 if (channels <= 1) return fileSize;
                 const uint64_t MB = 1024ULL * 1024;
@@ -14069,7 +14893,10 @@ void App::processBatchQueue() {
                 try {
                     std::filesystem::create_directories(destDir);
                 } catch (...) {}
-                std::string testPath = pathToUtf8(destDir) + "\\.afm_write_test";
+                std::string testPath = pathToUtf8(destDir);
+                appendPathSeparator(testPath, kLocalPathSeparator);
+                testPath += ".afm_write_test";
+#if defined(_WIN32)
                 HANDLE hTest = CreateFileW(toWide(testPath).c_str(), GENERIC_WRITE, 0, nullptr,
                                            CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
                 if (hTest == INVALID_HANDLE_VALUE) {
@@ -14082,6 +14909,22 @@ void App::processBatchQueue() {
                     break;
                 }
                 CloseHandle(hTest); // FILE_FLAG_DELETE_ON_CLOSE auto-deletes
+#else
+                {
+                    const int fd = ::open(testPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                    if (fd < 0) {
+                        batch->state = BatchState::Failed;
+                        const int err = errno;
+                        if (err == EACCES)
+                            batch->errorMessage = "Access denied: " + pathToUtf8(destDir) + "\n\nThis location requires elevated rights.";
+                        else
+                            batch->errorMessage = "Cannot write to: " + pathToUtf8(destDir) + " (errno " + std::to_string(err) + ")";
+                        break;
+                    }
+                    ::close(fd);  // then unlink: no FILE_FLAG_DELETE_ON_CLOSE on POSIX
+                    ::unlink(testPath.c_str());
+                }
+#endif
 
                 // Also check if destination file specifically is read-only
                 if (std::filesystem::exists(toFsPath(item.destPath))) {
@@ -14295,8 +15138,8 @@ void App::processBatchQueue() {
 
                         ok = dstDev.createFile(item.destPath, item.fileSize);
                         if (ok) {
-                            static const uint64_t MB = 1024ULL * 1024;
-                            static const uint64_t GB = 1024ULL * MB;
+                            const uint64_t MB = 1024ULL * 1024;
+                            (void)MB;
                             auto blockSizeFor = [](uint64_t fileSize, int channels) -> uint64_t {
                                 if (channels <= 1) return fileSize;
                                 const uint64_t MB = 1024ULL * 1024;
@@ -14386,7 +15229,7 @@ void App::processBatchQueue() {
                                     ch.curBlockTransferred = 0;
                                     ch.currentFile = item.displayName + " [" + formatSize(block.offset) + "]";
 
-                                    auto rangeProgress = [&](uint64_t transferred, uint64_t total) -> bool {
+                                    auto rangeProgress = [&](uint64_t transferred, uint64_t /*total*/) -> bool {
                                         if (m_shutdownTransfer || batch->stopRequested.load() || failed.load())
                                             return false;
                                         while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
@@ -14860,7 +15703,7 @@ std::string App::formatSize(uint64_t bytes) {
     int i = 0; double s = (double)bytes;
     while (s >= 1024.0 && i < 4) { s /= 1024.0; i++; }
     char buf[32];
-    if (i == 0) snprintf(buf, sizeof(buf), "%llu B", bytes);
+    if (i == 0) snprintf(buf, sizeof(buf), "%llu B", static_cast<unsigned long long>(bytes));
     else snprintf(buf, sizeof(buf), "%.1f %s", s, u[i]);
     return buf;
 }
@@ -14897,6 +15740,7 @@ std::string App::getFileIcon(const std::string& name, bool isDir) {
     return "   ";
 }
 
+#if defined(_WIN32)
 std::vector<std::string> App::getWindowsDrives() {
     std::vector<std::string> drives;
     DWORD mask = GetLogicalDrives();
@@ -14907,3 +15751,42 @@ std::vector<std::string> App::getWindowsDrives() {
     }
     return drives;
 }
+#else
+std::vector<std::string> App::getWindowsDrives() {
+    // Linux: enumerate mounted filesystems from /proc/mounts, excluding
+    // pseudo-filesystems and the app's own FUSE mounts (future).
+    std::vector<std::string> mounts;
+    std::ifstream f("/proc/mounts");
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t sp1 = line.find(' ');
+        if (sp1 == std::string::npos) continue;
+        const size_t sp2 = line.find(' ', sp1 + 1);
+        if (sp2 == std::string::npos) continue;
+        std::string target = line.substr(sp1 + 1, sp2 - sp1 - 1);
+        // decode octal escapes (\040 space)
+        std::string decoded;
+        for (size_t i = 0; i < target.size(); ++i) {
+            if (target[i] == '\\' && i + 3 < target.size() &&
+                target[i+1] >= '0' && target[i+1] <= '7') {
+                decoded.push_back(static_cast<char>(
+                    std::stoi(target.substr(i + 1, 3), nullptr, 8)));
+                i += 3;
+            } else decoded.push_back(target[i]);
+        }
+        const std::string fsType = line.substr(sp2 + 1, line.find(' ', sp2 + 1) - sp2 - 1);
+        if (fsType == "proc" || fsType == "sysfs" || fsType == "devtmpfs" ||
+            fsType == "devpts" || fsType == "tmpfs" || fsType == "cgroup2" ||
+            fsType == "efivarfs" || fsType == "bpf" || fsType == "tracefs" ||
+            fsType == "debugfs" || fsType == "configfs" || fsType == "fusectl" ||
+            fsType == "hugetlbfs" || fsType == "mqueue" || fsType == "ramfs" ||
+            fsType.rfind("fuse", 0) == 0)
+            continue;
+        if (decoded.rfind("/boot", 0) == 0 || decoded == "/" || decoded == "/efi")
+            continue;  // system mounts are not useful transfer roots
+        if (std::find(mounts.begin(), mounts.end(), decoded) == mounts.end())
+            mounts.push_back(std::move(decoded));
+    }
+    return mounts;
+}
+#endif

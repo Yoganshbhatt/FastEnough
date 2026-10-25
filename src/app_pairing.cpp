@@ -1,16 +1,18 @@
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <Windows.h>
+#include "crt_shims.h"
 #include "app.h"
 #include "ui_panels.h"
 #include "qrcodegen/qrcodegen.hpp"
-#include <bcrypt.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
-
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <Windows.h>
+#include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
+#endif
 
 namespace {
 std::string pairingToken(size_t length) {
@@ -18,8 +20,20 @@ std::string pairingToken(size_t length) {
     std::string token;
     while (token.size() < length) {
         std::array<unsigned char, 32> bytes{};
+#if defined(_WIN32)
         if (BCryptGenRandom(nullptr, bytes.data(), static_cast<ULONG>(bytes.size()),
             BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) throw std::runtime_error("Could not create a pairing code.");
+#else
+        {
+            // /dev/urandom: same guarantee, no Crypto++ dep needed for 32 bytes.
+            FILE* f = std::fopen("/dev/urandom", "rb");
+            if (!f || std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) {
+                if (f) std::fclose(f);
+                throw std::runtime_error("Could not create a pairing code.");
+            }
+            std::fclose(f);
+        }
+#endif
         for (auto byte : bytes) {
             if (byte >= 248) continue;
             token += alphabet[byte % 62];

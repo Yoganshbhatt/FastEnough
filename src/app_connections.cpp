@@ -1,4 +1,5 @@
 #include "app.h"
+#include "crt_shims.h"
 #include "ui_panels.h"
 #include <algorithm>
 #include <cctype>
@@ -596,7 +597,13 @@ void App::renderConnectionManager(FilePanel& panel) {
         ImGui::BeginDisabled(!m_connectionPendingSerial.empty());
         if (theme.button("##ConnectSavedDevice", m_connectionPendingSerial == address ? "Connecting" : "Connect", ui::Icon::Wifi,
             ImVec2(connectX, buttonY), ImVec2(buttonWidth, 34 * s), rgb(91, 222, 255), 4)) {
-            if (connectedSlot(address) >= 0) openDevice(DeviceInfo{address, savedName(saved), "device"});
+            if (connectedSlot(address) >= 0) {
+                DeviceInfo info{};
+                info.serial = address;
+                info.model = savedName(saved);
+                info.state = "device";
+                openDevice(info);
+            }
             else connectFromManager(address, true);
         }
         ImGui::EndDisabled();

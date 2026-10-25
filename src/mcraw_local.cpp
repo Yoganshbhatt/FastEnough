@@ -45,7 +45,7 @@ std::vector<WindowsFileEntry> listLocalMcraw(const std::string& mcrawPath) {
             auto sc = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
                 ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
             auto t = std::chrono::system_clock::to_time_t(sc);
-            struct tm tm; localtime_s(&tm, &t);
+            struct tm tm; localTimeSafe(&tm, &t);
             char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm);
             dateStr = buf;
         } catch (...) {}
@@ -906,6 +906,8 @@ bool extractLocalMcrawItem(const std::string& mcrawPath, const std::string& virt
             std::ofstream ofs(destPath, std::ios::binary);
             if (!ofs) return false;
             ofs.write(json.data(), json.size());
+            ofs.flush();
+            if (!ofs.good()) return false;
             if (progress) progress(json.size(), json.size());
             return true;
 
@@ -1042,7 +1044,15 @@ int extractLocalMcrawBatch(const std::string& mcrawPath,
             // Write DNG file
             char fname[64];
             snprintf(fname, sizeof(fname), "frame_%06d.dng", work->frameIndex + 1);
-            std::string outPath = destDir + "\\" + fname;
+            std::string outPath = destDir;
+            if (!outPath.empty() && outPath.back() != '/' && outPath.back() != '\\') {
+#if defined(_WIN32)
+                outPath += '\\';
+#else
+                outPath += '/';
+#endif
+            }
+            outPath += fname;
 
             if (writeDngDirect(outPath, work->pixelData.data(), work->pixelData.size(), work->params)) {
                 uint64_t fileSize = work->pixelData.size() + 1024;

@@ -2,6 +2,9 @@
 x64/
 Debug/
 Release/
+build/
+build-gui/
+cmake-build-*/
 *.obj
 *.pdb
 *.ilk
@@ -49,3 +52,10 @@ thirdparty/android-platform-tools/
 
 # Track Dokan vendored libs (override *.lib)
 !thirdparty/dokan/lib/**
+
+# Agent state (never shipped)
+.cortexkit/
+build-release/
+
+# Local working notes (never shipped)
+AGENTS.md

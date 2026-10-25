@@ -1,15 +1,29 @@
 #include "app.h"
+#include "crt_shims.h"
 #include "ui_widgets.h"
+#if defined(_WIN32)
 #include "device_dokan.h"
 #include "mcraw_projfs.h"
+#else
+#include "mount_stubs.h"
+#include "platform_linux.h"
+#endif
 #include <algorithm>
 #include <cctype>
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
 #include <shellapi.h>
+#endif
 
 namespace {
+#if defined(_WIN32)
+constexpr char kLocalPathSeparator = '\\';
+#else
+constexpr char kLocalPathSeparator = '/';
+#endif
+
 bool finished(BatchState state) {
     return state == BatchState::Completed || state == BatchState::Failed || state == BatchState::Stopped;
 }
@@ -36,12 +50,14 @@ std::string parentPath(const std::string& path) {
     return pos == std::string::npos ? path : path.substr(0, pos);
 }
 
+#if defined(_WIN32)
 std::wstring workspaceWide(const std::string& value) {
     int count = MultiByteToWideChar(CP_UTF8, 0, value.data(), (int)value.size(), nullptr, 0);
     std::wstring result(count, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, value.data(), (int)value.size(), result.data(), count);
     return result;
 }
+#endif
 }
 
 std::string App::deviceDisplayName(int slot) const {
@@ -59,7 +75,7 @@ std::string App::panelDisplayName(const FilePanel& panel) const {
 
 bool App::panelAvailable(const FilePanel& panel) const {
     if (panel.isConnections || !panel.pendingDeviceSerial.empty()) return false;
-    return !panel.isAndroid && !panel.isApps ||
+    return (!panel.isAndroid && !panel.isApps) ||
         (deviceSession(panel.deviceSlot).connected && deviceSession(panel.deviceSlot).client.isServerRunning());
 }
 
@@ -215,6 +231,7 @@ void App::renderWorkspaceToolbar() {
 }
 
 void App::renderPaneHeader(FilePanel& panel, PanelSide side) {
+    (void)side;
     const float s=ui::scale();
     ImGui::PushID(&panel);
     std::string title=panelDisplayName(panel);
@@ -309,7 +326,7 @@ void App::renderPaneNavigation(FilePanel& panel) {
     } else {
         std::vector<std::pair<std::string,std::string>> crumbs;
         std::string path=panel.currentPath;
-        char separator=panel.isAndroid?'/':'\\';
+        char separator=panel.isAndroid?'/':kLocalPathSeparator;
         size_t offset=0;
         if(panel.isAndroid&&path.starts_with('/')){crumbs.push_back({"/","/"});offset=1;}
         else if(path.size()>=3&&path[1]==':'){crumbs.push_back({path.substr(0,2),path.substr(0,3)});offset=3;}
@@ -515,13 +532,24 @@ void App::renderWorkspaceDrawer() {
                 if(ui::button("Network adapters",ui::Icon::Wifi))m_showNicConfig=true;
                 if(ui::button("Root, keep awake and ADB",ui::Icon::Settings))m_showDeviceSettings=true;
             }
-            ImGui::Spacing();ImGui::Separator();ImGui::Spacing();ImGui::TextDisabled("Windows integration");
+            ImGui::Spacing();ImGui::Separator();ImGui::Spacing();
+#if defined(_WIN32)
+            ImGui::TextDisabled("Windows integration");
+#else
+            ImGui::TextDisabled("Desktop integration");
+#endif
             auto& mount=DeviceMountManager::instance(slot);
             ImGui::BeginDisabled(!connected||m_asyncBusy);
             if(mount.isMounted()) {
                 if(ui::button("Open mounted drive",ui::Icon::Computer,ui::Appearance::Secondary)) {
+#if defined(_WIN32)
                     auto path=workspaceWide(mount.mountPoint());ShellExecuteW(nullptr,L"explore",path.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+#else
+                    std::string openErr;
+                    platform::shellOpen(mount.mountPoint(), openErr);
+#endif
                 }
+#if defined(_WIN32)
                 if(ui::button("Unmount drive"))postAsync("Unmounting drive...",[slot](){DeviceMountManager::instance(slot).unmount();});
             } else if(ui::button("Mount as drive",ui::Icon::Computer,ui::Appearance::Secondary)) {
                 std::string root=deviceSession(slot).storageRoot,drive=DeviceMountManager::availableMountPoint();
@@ -531,6 +559,17 @@ void App::renderWorkspaceDrawer() {
                     m_statusTime=std::chrono::steady_clock::now();
                 });
             }
+#else
+                if(ui::button("Unmount folder"))postAsync("Unmounting folder...",[slot](){DeviceMountManager::instance(slot).unmount();});
+            } else if(ui::button("Mount as folder",ui::Icon::Computer,ui::Appearance::Secondary)) {
+                std::string root=deviceSession(slot).storageRoot,drive=DeviceMountManager::availableMountPoint(slot);
+                postAsync("Mounting folder...",[this,slot,root,drive](){
+                    bool ok=DeviceMountManager::instance(slot).mount(&deviceSession(slot).client,root,drive);
+                    m_statusMessage=ok?"Mounted at "+drive:"Unable to mount. Check the libfuse3 installation.";
+                    m_statusTime=std::chrono::steady_clock::now();
+                });
+            }
+#endif
             ImGui::EndDisabled();
             ImGui::Spacing();if(ui::button("Pair over WiFi",ui::Icon::Wifi))openWifiPairing();
             ImGui::BeginDisabled(!connected);
@@ -553,7 +592,7 @@ void App::renderWorkspaceDrawer() {
                         bool mcraw=name.size()>6&&_stricmp(name.c_str()+name.size()-6,".mcraw")==0;
                         ImGui::BeginDisabled(!panelAvailable(*panel));
                         if(mcraw&&ui::button("Browse frames",ui::Icon::Folder,ui::Appearance::Secondary)) {
-                            std::string path=panel->currentPath;char sep=panel->isAndroid?'/':'\\';if(!path.empty()&&path.back()!=sep)path+=sep;path+=name;
+                            std::string path=panel->currentPath;char sep=panel->isAndroid?'/':kLocalPathSeparator;if(!path.empty()&&path.back()!=sep)path+=sep;path+=name;
                             if(panel->isAndroid)navigateToDirectory(*panel,path);
                             else postAsync("Opening MotionCam frames...",[this,panel,path](){
                                 std::string mounted=McrawMountManager::instance().mountMcraw(path);

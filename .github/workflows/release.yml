@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to publish (vMAJOR.MINOR.PATCH)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux release artifact
+    runs-on: ubuntu-22.04
+    env:
+      GLFW_PREFIX: ${{ github.workspace }}/.deps/glfw
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config curl unzip git \
+            libfuse3-dev libgl1-mesa-dev libgtk-3-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+
+      - name: Cache GLFW
+        uses: actions/cache@v4
+        with:
+          path: .deps/glfw
+          key: glfw-3.4-static-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build GLFW 3.4 (static)
+        run: |
+          set -euo pipefail
+          if [ -f "$GLFW_PREFIX/lib/libglfw3.a" ]; then
+            echo "GLFW already cached"
+            exit 0
+          fi
+          git clone --depth 1 --branch 3.4 https://github.com/glfw/glfw.git /tmp/glfw
+          cmake -S /tmp/glfw -B /tmp/glfw/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GLFW_PREFIX" \
+            -DGLFW_BUILD_SHARED_LIBS=OFF \
+            -DGLFW_BUILD_WAYLAND=ON -DGLFW_BUILD_X11=ON \
+            -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF \
+            -DGLFW_BUILD_DOCS=OFF
+          cmake --build /tmp/glfw/build
+          cmake --install /tmp/glfw/build
+
+      - run: ./setup.sh
+
+      - name: Build GUI and CLI
+        run: |
+          cmake -S . -B build-gui -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DAFM_BUILD_GUI=ON -DCMAKE_PREFIX_PATH="$GLFW_PREFIX"
+          cmake --build build-gui
+
+      - name: Fetch platform-tools (bundled, matches Windows release)
+        run: |
+          curl -fsSL -o /tmp/platform-tools.zip \
+            https://dl.google.com/android/repository/platform-tools-latest-linux.zip
+          unzip -q /tmp/platform-tools.zip -d thirdparty/android-platform-tools
+          test -x thirdparty/android-platform-tools/platform-tools/adb
+
+      - name: Package
+        run: |
+          version="${{ github.event.inputs.version || github.ref_name }}"
+          scripts/package-release.sh --version "$version" --build-dir build-gui --skip-build --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tarball
+          path: dist/fast-enough-*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows release artifact
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+      - shell: pwsh
+        run: ./setup.ps1
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          msbuild "Android File Manager.vcxproj" -p:Configuration=Release -p:Platform=x64 -m -verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Stage unsigned zip
+        shell: pwsh
+        run: |
+          $stage = "dist/fast-enough-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "x64\Release\Fast Enough - Android File Explorer.exe" $stage
+          Copy-Item "thirdparty\dokan\lib\x64\dokan2.dll" $stage
+          Copy-Item "readme.txt" $stage
+          Copy-Item "projfs_enable.png" $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\fast-enough-windows-x64.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: dist/fast-enough-windows-x64.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [linux, windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          files: artifacts/*
+          draft: true
+          generate_release_notes: true
+          body: |
+            Linux: extract the tarball and run `./install.sh` (installs to
+            `~/.local`). Built against glibc 2.35, so it runs on Ubuntu 22.04+,
+            Debian 12+, Fedora 36+ and current Arch-based distributions.
+
+            Windows: unzip and run the executable; the signed installer with the
+            Dokan driver is produced separately with `scripts/package-release.ps1`.

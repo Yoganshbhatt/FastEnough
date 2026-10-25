@@ -260,7 +260,7 @@ struct FilePanel {
         if (isAndroid) {
             // Convert mtime to string
             time_t t = (time_t)androidEntries[i].mtime;
-            struct tm tm; localtime_s(&tm, &t);
+            struct tm tm; localTimeSafe(&tm, &t);
             char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm);
             return buf;
         }
@@ -583,6 +583,7 @@ private:
     void startTransfer(bool pullFromAndroid, bool move = false);
     void startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel);
     void queuePanelTransfer(FilePanel& srcPanel, FilePanel& dstPanel, bool move);
+    void exportSelectionToFolder(FilePanel& srcPanel, const std::string& destDir);
     void processBatchQueue();
 
     std::string queryDeviceDisplayName(const std::string& serial);

@@ -16,13 +16,21 @@ inline bool copyLocalFile(const std::filesystem::path& source, const std::filesy
     auto error=[](const char* operation) {
         return std::runtime_error(std::string(operation)+": "+std::generic_category().message(errno));
     };
+#if defined(_WIN32)
     FILE* input=nullptr;
     if (_wfopen_s(&input,source.c_str(),L"rb")!=0 || !input) throw error("Cannot open source");
-    std::unique_ptr<FILE,decltype(&fclose)> in(input,&fclose);
+    std::unique_ptr<FILE,int(*)(FILE*)> in(input,&fclose);
     FILE* output=nullptr;
     if (_wfopen_s(&output,destination.c_str(),L"wb")!=0 || !output) throw error("Cannot open destination");
+#else
+    FILE* input=std::fopen(source.c_str(),"rb");
+    if (!input) throw error("Cannot open source");
+    std::unique_ptr<FILE,int(*)(FILE*)> in(input,&fclose);
+    FILE* output=std::fopen(destination.c_str(),"wb");
+    if (!output) throw error("Cannot open destination");
+#endif
     destinationTouched=true;
-    std::unique_ptr<FILE,decltype(&fclose)> out(output,&fclose);
+    std::unique_ptr<FILE,int(*)(FILE*)> out(output,&fclose);
     std::vector<char> buffer(4*1024*1024);
     uint64_t copied=0;
     while (true) {

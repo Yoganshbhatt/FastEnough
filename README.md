@@ -108,20 +108,41 @@ Use `Mount as drive` from inside the app. The device shows up as `P:\` (or `Q:\`
 
 Use the in-app Setup Wizard or pair via WiFi ADB from your device's developer settings. Once paired, transfers work the same way.
 
+## Linux
+
+The client also builds and runs natively on Linux from the same tree. The phone
+is mounted as a directory through FUSE instead of a drive letter, and MCRAW
+recordings open as read-only virtual folders.
+
+Build requirements, installation, the virtual drive, platform substitutions and
+known limitations are documented in **[LINUX.md](LINUX.md)**.
+
+```bash
+./setup.sh
+cmake -S . -B build-gui -DAFM_BUILD_GUI=ON
+cmake --build build-gui -j"$(nproc)"
+./build-gui/fast-enough
+```
+
 ## Project layout
 
 ```
 .
-├── src/                     Windows client (ImGui + DX11)
+├── src/                     Client sources (shared core, Win32 and Linux backends)
 ├── server/                  Android server (C++17, static ARM64 ELF)
 ├── res/                     Icon and resource script (embeds server binary)
 ├── thirdparty/              Vendored dependencies (Dokan, MotionCam, simde, etc.)
-├── setup.ps1                Fetches Dear ImGui
+├── tools/                   afm-cli and the test suites
+├── setup.ps1 / setup.sh     Fetch Dear ImGui (Windows / Linux)
+├── CMakeLists.txt           Linux build (CLI + GUI)
 ├── Android File Manager.vcxproj
+├── LINUX.md                 Linux build, install and platform notes
 └── README.md
 ```
 
-Runtime data lives under `%APPDATA%\FastEnough\` (preferences, window state, ImGui layout).
+Runtime data lives under `%APPDATA%\FastEnough\` on Windows and under the XDG
+directories on Linux (`~/.config/FastEnough/`, `~/.cache/FastEnough/`,
+`~/.local/state/FastEnough/`).
 
 ## Performance notes
 

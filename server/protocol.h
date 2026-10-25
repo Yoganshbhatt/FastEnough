@@ -10,6 +10,15 @@
 #define AFM_VERSION 3
 #define AFM_CHUNK_SIZE (4 * 1024 * 1024)  // 4MB transfer chunks
 
+// Struct packing: GCC/Clang take an attribute, MSVC takes #pragma pack. Both
+// sides of the wire must agree on layout, so the macros live here.
+#if defined(_MSC_VER)
+#define AFM_PACKED
+#pragma pack(push, 1)
+#else
+#define AFM_PACKED __attribute__((packed))
+#endif
+
 // Commands (client -> server)
 enum {
     CMD_PING       = 1,
@@ -37,7 +46,23 @@ enum {
     CMD_INSTALL_BATCH = 23, // payload: JSON manifest of staged APK groups
     CMD_RESTORE_BACKUP_ARCHIVE = 24, // payload: JSON restore manifest for a staged ZIP64 store archive
     CMD_CREATE_BACKUP_ARCHIVE = 25, // payload: JSON app selection, returns a device-local ZIP64 store archive
+    CMD_CREATE_FILE_EX = 26, // payload: [4B flags][8B total_size][path string]
+    CMD_TRUNCATE = 27,       // payload: [8B size][path string]
+    CMD_RENAME_EX = 28,      // payload: [4B flags][4B old_len][old_path][new_path]
+    CMD_CAPABILITIES = 29,   // payload: none - returns capability flags
+    CMD_REMOVE_FILE = 30,    // payload: path string - unlink a file (never recursive)
+    CMD_RMDIR = 31,          // payload: path string - rmdir an empty directory
 };
+
+// Capability bits returned by CMD_CAPABILITIES.
+#define AFM_CAP_FUSE_WRITE 0x00000001u  // CREATE_FILE_EX, TRUNCATE, RENAME_EX, REMOVE_FILE, RMDIR
+
+// Flags for CMD_CREATE_FILE_EX.
+#define AFM_CREATE_TRUNCATE  0x00000001u
+#define AFM_CREATE_EXCLUSIVE 0x00000002u
+
+// Flags for CMD_RENAME_EX.
+#define AFM_RENAME_REPLACE 0x00000001u
 
 // Responses (server -> client)
 enum {
@@ -51,7 +76,7 @@ enum {
 typedef struct {
     uint32_t cmd;        // command or response code
     uint32_t length;     // payload length in bytes
-} __attribute__((packed)) MsgHeader;
+} AFM_PACKED MsgHeader;
 
 // File entry in LIST response
 typedef struct {
@@ -60,22 +85,26 @@ typedef struct {
     int64_t  mtime;      // unix timestamp
     uint32_t name_len;
     // followed by name_len bytes of name
-} __attribute__((packed)) FileEntryHeader;
+} AFM_PACKED FileEntryHeader;
 
 // PULL response header (after RSP_OK)
 typedef struct {
     uint64_t file_size;
-} __attribute__((packed)) PullHeader;
+} AFM_PACKED PullHeader;
 
 // PUSH command payload prefix
 typedef struct {
     uint64_t file_size;
     // followed by path string (length = msg.length - 8)
-} __attribute__((packed)) PushHeader;
+} AFM_PACKED PushHeader;
 
 // STAT response
 typedef struct {
     uint8_t  type;       // 0=file, 1=dir, 2=symlink, 255=not found
     uint64_t size;
     int64_t  mtime;
-} __attribute__((packed)) StatResponse;
+} AFM_PACKED StatResponse;
+
+#if defined(_MSC_VER)
+#pragma pack(pop)
+#endif

@@ -1,4 +1,5 @@
 #include <motioncam/RawData.hpp>
+#include <cstring>
 #include <vector>
 
 namespace motioncam {

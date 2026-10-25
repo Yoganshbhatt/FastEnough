@@ -104,7 +104,18 @@ public:
 
     // ADB track-devices: persistent connection to ADB server for instant device notifications
     // Returns a connected socket, or INVALID_SOCKET on failure. Caller reads device updates.
+    // Windows build also reads WSAGetLastError() in the track loop for its
+    // timeout check; Linux uses lastTrackWaitTimedOut() instead.
     uintptr_t openTrackDevices();
+#if !defined(_WIN32)
+    // True when the previous readTrackDevicesUpdate on this thread expired its
+    // idle wait (Windows build uses WSAETIMEDOUT for the same purpose).
+    static bool lastTrackWaitTimedOut();
+    // Attach to an already-running helper through a local adb forward instead
+    // of deploying one. Used by the read/write test harness so it never stops
+    // a helper that a GUI session owns.
+    bool connectLocalPort(int port);
+#endif
     // Read one device update from a track-devices socket. Blocks until data arrives or error.
     // Returns parsed device list, or empty on error/disconnect.
     std::vector<DeviceInfo> readTrackDevicesUpdate(uintptr_t sock, bool* receivedUpdate = nullptr);
@@ -209,6 +220,13 @@ public:
     uint64_t readRange(const std::string& remotePath, uint64_t offset, uint64_t length,
                        void* outBuffer);
 
+#if !defined(_WIN32)
+    // FUSE-facing variant: distinguishes a clean EOF (ok=true, count=0) from a
+    // transport/protocol failure (ok=false), which readRange cannot express.
+    uint64_t readRangeWithStatus(const std::string& remotePath, uint64_t offset, uint64_t length,
+                                 void* outBuffer, bool& ok);
+#endif
+
     // Streaming read range: fetches [offset, offset+length) and calls chunkCallback for each
     // chunk as it arrives. Callback receives (chunkData, chunkLen, chunkOffset) and returns
     // true to continue, false to abort. Returns total bytes delivered.
@@ -236,6 +254,23 @@ public:
     bool createDirectory(const std::string& path);
     bool renameFile(const std::string& oldPath, const std::string& newPath);
     uint64_t getFileSize(const std::string& path);
+#if !defined(_WIN32)
+    // Stat with a distinguishable miss/error result. getFileSize() returns 0
+    // for both an empty file and a failure, which is not enough for FUSE.
+    bool statPath(const std::string& path, DeviceFileEntry& out,
+                  std::string* error = nullptr);
+
+    // Additive server capabilities used by the FUSE write backend. Servers
+    // built before these commands return an error; call capabilities() first.
+    uint32_t capabilities();
+    bool createFileEx(const std::string& remotePath, uint64_t totalSize,
+                      bool truncate, bool exclusive);
+    bool truncateFile(const std::string& remotePath, uint64_t size);
+    bool renameFileEx(const std::string& oldPath, const std::string& newPath,
+                      bool replace);
+    bool unlinkFile(const std::string& remotePath);
+    bool rmdirDirectory(const std::string& remotePath);
+#endif
 
     // MCRAW virtual directory support
     std::vector<DeviceFileEntry> listMcraw(const std::string& mcrawPath);
@@ -276,6 +311,8 @@ public:
     std::string getServerBinaryPath();
 
 private:
+    uint64_t readRangeInternal(const std::string& remotePath, uint64_t offset, uint64_t length,
+                               void* outBuffer, bool& ok);
     void stopDeviceServerProcesses(const std::string& serial);
     bool sendAll(const void* data, size_t len);
     bool recvAll(void* data, size_t len);
@@ -298,8 +335,17 @@ private:
     // control channels). Do not touch m_connected.
     static bool sendAllOn(uintptr_t sock, const void* data, size_t len);
     static bool recvAllOn(uintptr_t sock, void* data, size_t len);
+#if defined(_WIN32)
+    // Windows definitions stay exactly as before (device_client.cpp); the
+    // POSIX transfer core adds explicit per-op deadlines.
     static bool sendMsgOn(uintptr_t sock, uint32_t cmd, const void* payload, uint32_t len);
     static bool recvMsgOn(uintptr_t sock, MsgHeader& hdr, std::vector<char>& payload);
+#else
+    static bool sendMsgOn(uintptr_t sock, uint32_t cmd, const void* payload, uint32_t len,
+                          uint32_t sendTimeoutMs = 0);
+    static bool recvMsgOn(uintptr_t sock, MsgHeader& hdr, std::vector<char>& payload,
+                          uint32_t recvTimeoutMs = 0);
+#endif
 
     // Lazy-open the control channel. Caller must hold m_controlMutex.
     bool ensureControlChannelLocked();
@@ -331,6 +377,12 @@ private:
     uintptr_t m_ctlSocket = ~(uintptr_t)0;
     bool m_ctlConnected = false;
     std::mutex m_ctlMutex;
+#if !defined(_WIN32)
+    // Mirrors m_ctlSocket so an unmount on another thread can shutdown() the
+    // control channel without taking m_ctlMutex (which the blocked callback
+    // holds). -1 when no control channel is open.
+    std::atomic<int> m_ctlInterruptFd{-1};
+#endif
     std::string m_lastConnectHost;
     int m_lastConnectPort = 0;
     std::string m_lastConnectBindIp;
