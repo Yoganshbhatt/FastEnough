@@ -118,16 +118,18 @@ target_include_directories(afm_mcraw PUBLIC
   thirdparty/motioncam/include thirdparty/tinydng)
 target_link_libraries(afm_mcraw PUBLIC afm_portable pthread)
 
-# Optional at configure time: without libfuse3 the GUI still builds and the
-# mount menu reports that the backend was not built. Release builds should
-# pass -DAFM_REQUIRE_FUSE=ON.
-option(AFM_REQUIRE_FUSE "Fail the build when libfuse3 is missing" OFF)
+# libfuse3 is loaded at runtime (see src/fuse_api.h): the headers are needed to
+# build, but the binary must not link the shared object, because its SONAME
+# changed between 3.17 (libfuse3.so.3) and 3.18 (libfuse3.so.4) and a linked
+# binary would refuse to start on the other half of the distributions.
+option(AFM_REQUIRE_FUSE "Fail the build when the libfuse3 headers are missing" OFF)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
-  pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
+  pkg_check_modules(FUSE3 QUIET fuse3)
 endif()
 if(FUSE3_FOUND)
   add_library(afm_fuse STATIC
+    src/fuse_api.cpp
     src/fuse_common.cpp
     src/fuse_paths.cpp
     src/fs_fuse.cpp
@@ -135,8 +137,9 @@ if(FUSE3_FOUND)
   )
   target_include_directories(afm_fuse PUBLIC src
     PRIVATE ${IMGUI_DIR} ${CMAKE_SOURCE_DIR}/thirdparty
-            ${CMAKE_SOURCE_DIR}/thirdparty/nlohmann)
-  target_link_libraries(afm_fuse PUBLIC afm_client_core afm_mcraw PkgConfig::FUSE3)
+            ${CMAKE_SOURCE_DIR}/thirdparty/nlohmann
+            ${FUSE3_INCLUDE_DIRS})
+  target_link_libraries(afm_fuse PUBLIC afm_client_core afm_mcraw ${CMAKE_DL_LIBS})
   target_compile_definitions(afm_fuse PUBLIC AFM_HAVE_FUSE=1)
 
   add_executable(fuse_test tools/fuse_test.cpp)

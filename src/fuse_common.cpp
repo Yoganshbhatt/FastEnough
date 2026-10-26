@@ -2,6 +2,8 @@
 
 #include "fuse_common.h"
 
+#include "fuse_api.h"
+
 #include <fuse.h>
 
 #include <cerrno>
@@ -45,7 +47,7 @@ void fillReaddirStat(const Node& node, struct stat& st) {
 }
 
 int cbGetattr(const char* path, struct stat* st, struct fuse_file_info*) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     std::string normalized;
     int error = 0;
     if (!normalizePath(path, normalized, error)) return -error;
@@ -62,7 +64,7 @@ int cbReadlink(const char*, char*, size_t) {
 
 int cbReaddir(const char* path, void* buffer, fuse_fill_dir_t filler, off_t offset,
               struct fuse_file_info*, enum fuse_readdir_flags flags) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     std::string normalized;
     int error = 0;
     if (!normalizePath(path, normalized, error)) return -error;
@@ -103,7 +105,7 @@ int cbReaddir(const char* path, void* buffer, fuse_fill_dir_t filler, off_t offs
 
 int cbOpen(const char* path, struct fuse_file_info* fi) {
     if (!fi) return -EINVAL;
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     std::string normalized;
     int error = 0;
     if (!normalizePath(path, normalized, error)) return -error;
@@ -130,7 +132,7 @@ int cbOpen(const char* path, struct fuse_file_info* fi) {
 int cbRead(const char* path, char* buffer, size_t size, off_t offset,
            struct fuse_file_info* fi) {
     if (!fi) return -EINVAL;
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     Handle* handle = reinterpret_cast<Handle*>(fi->fh);
     std::string normalized;
     int error = 0;
@@ -155,7 +157,7 @@ int cbRead(const char* path, char* buffer, size_t size, off_t offset,
 
 int cbRelease(const char* path, struct fuse_file_info* fi) {
     if (!fi) return 0;
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     Handle* handle = reinterpret_cast<Handle*>(fi->fh);
     if (handle) {
         int error = 0;
@@ -173,7 +175,7 @@ int cbRelease(const char* path, struct fuse_file_info* fi) {
 
 int cbCreate(const char* path, mode_t mode, struct fuse_file_info* fi) {
     if (!fi) return -EINVAL;
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     if (ctx->readOnly) return -EROFS;
     std::string normalized;
     int error = 0;
@@ -192,7 +194,7 @@ int cbCreate(const char* path, mode_t mode, struct fuse_file_info* fi) {
 int cbWrite(const char* path, const char* buffer, size_t size, off_t offset,
             struct fuse_file_info* fi) {
     if (!fi) return -EINVAL;
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     if (ctx->readOnly) return -EROFS;
     if (offset < 0) return -EINVAL;
     Handle* handle = reinterpret_cast<Handle*>(fi->fh);
@@ -211,7 +213,7 @@ int cbWrite(const char* path, const char* buffer, size_t size, off_t offset,
 }
 
 int cbTruncate(const char* path, off_t size, struct fuse_file_info* fi) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     if (ctx->readOnly) return -EROFS;
     if (size < 0) return -EINVAL;
     Handle* handle = fi ? reinterpret_cast<Handle*>(fi->fh) : nullptr;
@@ -230,7 +232,7 @@ int cbTruncate(const char* path, off_t size, struct fuse_file_info* fi) {
 }
 
 int cbUnlink(const char* path) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     if (ctx->readOnly) return -EROFS;
     std::string normalized;
     int error = 0;
@@ -240,7 +242,7 @@ int cbUnlink(const char* path) {
 }
 
 int cbMkdir(const char* path, mode_t mode) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     if (ctx->readOnly) return -EROFS;
     std::string normalized;
     int error = 0;
@@ -250,7 +252,7 @@ int cbMkdir(const char* path, mode_t mode) {
 }
 
 int cbRmdir(const char* path) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     if (ctx->readOnly) return -EROFS;
     std::string normalized;
     int error = 0;
@@ -260,7 +262,7 @@ int cbRmdir(const char* path) {
 }
 
 int cbRename(const char* from, const char* to, unsigned int flags) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     if (ctx->readOnly) return -EROFS;
     if (flags & ~static_cast<unsigned int>(RENAME_NOREPLACE)) return -EINVAL;
     std::string oldPath;
@@ -275,7 +277,7 @@ int cbRename(const char* from, const char* to, unsigned int flags) {
 }
 
 int cbFlush(const char* path, struct fuse_file_info* fi) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     Handle* handle = fi ? reinterpret_cast<Handle*>(fi->fh) : nullptr;
     std::string normalized;
     int error = 0;
@@ -288,7 +290,7 @@ int cbFlush(const char* path, struct fuse_file_info* fi) {
 }
 
 int cbFsync(const char* path, int, struct fuse_file_info* fi) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     Handle* handle = fi ? reinterpret_cast<Handle*>(fi->fh) : nullptr;
     std::string normalized;
     int error = 0;
@@ -301,7 +303,7 @@ int cbFsync(const char* path, int, struct fuse_file_info* fi) {
 }
 
 int cbUtimens(const char* path, const struct timespec[2], struct fuse_file_info* fi) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     if (ctx->readOnly) return -EROFS;
     Handle* handle = fi ? reinterpret_cast<Handle*>(fi->fh) : nullptr;
     std::string normalized;
@@ -316,7 +318,7 @@ int cbUtimens(const char* path, const struct timespec[2], struct fuse_file_info*
 }
 
 int cbStatfs(const char*, struct statvfs* st) {
-    auto* ctx = static_cast<FuseCtx*>(fuse_get_context()->private_data);
+    auto* ctx = static_cast<FuseCtx*>(api::context()->private_data);
     int error = 0;
     if (!ctx->backend->statfs(*st, error)) return -error;
     if (ctx->readOnly) st->f_flag |= ST_RDONLY;
@@ -334,7 +336,7 @@ void* cbInit(struct fuse_conn_info* conn, struct fuse_config* cfg) {
     conn->max_read = 1048576;
     // Larger requests let a 1 MiB-at-a-time writer reach the device in one op.
     conn->max_write = 1048576;
-    return fuse_get_context()->private_data;
+    return api::context()->private_data;
 }
 
 void cbDestroy(void*) {
@@ -421,6 +423,10 @@ bool Server::start(std::string& error) {
         error = "FUSE backend is missing";
         return false;
     }
+    if (!api::ensureLoaded()) {
+        error = api::loadError();
+        return false;
+    }
 
     struct stat before{};
     m_impl->mountPointExisted = ::lstat(m_mountPoint.c_str(), &before) == 0;
@@ -437,9 +443,9 @@ bool Server::start(std::string& error) {
     };
 
     fuse_args args = FUSE_ARGS_INIT(0, nullptr);
-    if (fuse_opt_add_arg(&args, "fast-enough") != 0 ||
-        fuse_opt_add_arg(&args, "-o") != 0) {
-        fuse_opt_free_args(&args);
+    if (api::optAddArg(&args, "fast-enough") != 0 ||
+        api::optAddArg(&args, "-o") != 0) {
+        api::optFreeArgs(&args);
         error = "cannot allocate FUSE arguments";
         cleanupMountPoint();
         return false;
@@ -451,23 +457,23 @@ bool Server::start(std::string& error) {
         "attr_timeout=1,entry_timeout=1,negative_timeout=0,max_read=1048576,"
         "nosuid,nodev";
     if (m_readOnly) options += ",ro";
-    if (fuse_opt_add_arg(&args, options.c_str()) != 0) {
-        fuse_opt_free_args(&args);
+    if (api::optAddArg(&args, options.c_str()) != 0) {
+        api::optFreeArgs(&args);
         error = "cannot allocate FUSE options";
         cleanupMountPoint();
         return false;
     }
 
-    m_impl->fuse = fuse_new(&args, &fuseOps(), sizeof(fuse_operations), &m_impl->ctx);
-    fuse_opt_free_args(&args);
+    m_impl->fuse = api::newFs(&args, &fuseOps(), sizeof(fuse_operations), &m_impl->ctx);
+    api::optFreeArgs(&args);
     if (!m_impl->fuse) {
         error = std::string("fuse_new failed: ") + std::strerror(errno);
         cleanupMountPoint();
         return false;
     }
-    if (fuse_mount(m_impl->fuse, m_mountPoint.c_str()) != 0) {
+    if (api::mount(m_impl->fuse, m_mountPoint.c_str()) != 0) {
         error = std::string("fuse_mount(") + m_mountPoint + "): " + std::strerror(errno);
-        fuse_destroy(m_impl->fuse);
+        api::destroy(m_impl->fuse);
         m_impl->fuse = nullptr;
         cleanupMountPoint();
         return false;
@@ -481,7 +487,7 @@ bool Server::start(std::string& error) {
                 const std::lock_guard<std::mutex> lock(impl->loopIdMutex);
                 impl->loopId = std::this_thread::get_id();
             }
-            const int rc = fuse_loop(impl->fuse);
+            const int rc = api::loop(impl->fuse);
             if (rc != 0) {
                 LOG_WARN("FUSE", "fuse_loop ended with " + std::to_string(rc) +
                                      ": " + std::strerror(errno));
@@ -490,8 +496,8 @@ bool Server::start(std::string& error) {
         });
     } catch (const std::system_error& e) {
         m_impl->running.store(false);
-        fuse_unmount(m_impl->fuse);
-        fuse_destroy(m_impl->fuse);
+        api::unmount(m_impl->fuse);
+        api::destroy(m_impl->fuse);
         m_impl->fuse = nullptr;
         cleanupMountPoint();
         error = std::string("cannot start FUSE loop thread: ") + e.what();
@@ -518,13 +524,13 @@ void Server::stop() {
         // fuse_exit() only sets a flag; the loop is normally blocked in
         // read(/dev/fuse). Unmounting closes the channel and wakes it. The
         // loop owns no resources that unmount needs, so this ordering is safe.
-        fuse_exit(m_impl->fuse);
-        fuse_unmount(m_impl->fuse);
+        api::exitFs(m_impl->fuse);
+        api::unmount(m_impl->fuse);
     }
     if (m_impl->loop.joinable()) m_impl->loop.join();
 
     if (m_impl->fuse) {
-        fuse_destroy(m_impl->fuse);
+        api::destroy(m_impl->fuse);
         m_impl->fuse = nullptr;
     }
 

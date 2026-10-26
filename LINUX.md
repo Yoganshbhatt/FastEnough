@@ -22,6 +22,8 @@ Runtime:
 * `adb` on `PATH`, in `~/Android/Sdk/platform-tools/`, or bundled with the
   release tarball (looked up next to the executable).
 * `fusermount3` and access to `/dev/fuse` for the virtual drive (FUSE).
+  The `fuse3` package is optional: without it the client still starts and only
+  the mount actions report that mounting is unavailable.
 * Optional: GTK3 for the tray icon, `zenity` for native file dialogs,
   `gio` for Trash.
 
@@ -85,6 +87,20 @@ To build a tarball yourself:
 ```bash
 ./scripts/package-release.sh --version v1.0.16
 ```
+
+On Arch or CachyOS the repository also ships a `PKGBUILD` that builds against
+the system libraries:
+
+```bash
+cd packaging/arch
+makepkg -si
+```
+
+The release tarball deliberately does not link against a distribution's
+`libfuse3`: its SONAME changed from `libfuse3.so.3` to `libfuse3.so.4` in
+libfuse 3.18, so a linked binary refuses to start on one half of the
+distributions. The library is loaded at runtime instead, which also means the
+client starts on systems without FUSE and only the mount actions report it.
 
 ## The phone drive (FUSE)
 

@@ -4,6 +4,7 @@
 // Returns 77 when /dev/fuse is unavailable so CTest reports a skip instead of
 // a failure on machines without FUSE.
 #include "fuse_common.h"
+#include "fuse_api.h"
 
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -229,6 +230,10 @@ int main() {
     }
 
     {
+        if (!afm::fuse::api::ensureLoaded()) {
+            std::printf("SKIP synthetic mount: %s\n", afm::fuse::api::loadError().c_str());
+            return g_failures == 0 ? 77 : 1;
+        }
         auto server = std::make_unique<afm::fuse::Server>(
             std::make_unique<SyntheticBackend>(), mountPoint, "FastEnough-test", true);
         std::string startError;

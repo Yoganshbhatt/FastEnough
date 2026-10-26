@@ -98,6 +98,11 @@ jobs:
           if ldd "$root/fast-enough" | grep -q libglfw; then
             echo "GLFW was linked dynamically" >&2; exit 1
           fi
+          # libfuse3 is dlopen()ed: its SONAME changed from .so.3 to .so.4 in
+          # 3.18, so linking it would break the artifact on half the distros.
+          if ldd "$root/fast-enough" | grep -q libfuse3; then
+            echo "libfuse3 was linked instead of loaded at runtime" >&2; exit 1
+          fi
           # Keep the glibc floor at the runner baseline so the artifact runs on
           # older distributions instead of only the newest ones.
           floor="$(objdump -T "$root/fast-enough" | grep -o 'GLIBC_2\.[0-9]*' | sort -Vu | tail -1)"
