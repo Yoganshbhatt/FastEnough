@@ -201,13 +201,9 @@ afm_install_bin_symlink(afm-cli)
 # Build with: cmake -B build-gui -DAFM_BUILD_GUI=ON
 option(AFM_BUILD_GUI "Build the fast-enough GUI" OFF)
 if(AFM_BUILD_GUI)
-# Optional StatusNotifier tray. GTK3 is needed to build it; the indicator
-# library itself is loaded with dlopen at runtime, so the GUI still starts on
-# systems without it. Without GTK3 headers the GUI builds with a tray stub.
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-  pkg_check_modules(GTK3 QUIET gtk+-3.0)
-endif()
+# The status tray needs no build-time libraries: libgtk-3 (gtk_api.cpp) and
+# libayatana-appindicator are both resolved with dlopen at runtime, so the GUI
+# builds and runs on systems without either of them.
 add_executable(fast-enough
   src/app.cpp
   src/app_connections.cpp
@@ -215,6 +211,7 @@ add_executable(fast-enough
   src/app_sessions.cpp
   src/app_workspace.cpp
   src/backup_archive.cpp
+  src/gtk_api.cpp
   src/main_linux.cpp
   src/tray_linux.cpp
 )
@@ -233,15 +230,6 @@ if(FUSE3_FOUND)
   target_link_libraries(fast-enough PRIVATE afm_fuse)
 endif()
 target_compile_definitions(fast-enough PRIVATE AFM_RES_DIR="${CMAKE_SOURCE_DIR}/res")
-if(GTK3_FOUND)
-  target_compile_definitions(fast-enough PRIVATE AFM_HAVE_GTK=1)
-  target_include_directories(fast-enough PRIVATE ${GTK3_INCLUDE_DIRS})
-  target_link_directories(fast-enough PRIVATE ${GTK3_LIBRARY_DIRS})
-  target_link_libraries(fast-enough PRIVATE ${GTK3_LIBRARIES} dl)
-  message(STATUS "Tray: GTK ${GTK3_VERSION} (appindicator loaded at runtime)")
-else()
-  message(STATUS "Tray: GTK3 not found; tray disabled")
-endif()
 
 install(TARGETS fast-enough RUNTIME DESTINATION "${AFM_INSTALL_LIBDIR}")
 afm_install_bin_symlink(fast-enough)

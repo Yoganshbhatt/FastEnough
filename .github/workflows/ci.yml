@@ -27,10 +27,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config curl unzip git \
-            libfuse3-dev libgl1-mesa-dev libgtk-3-dev \
+            libfuse3-dev libgl1-mesa-dev \
             libwayland-dev wayland-protocols libxkbcommon-dev \
             libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
 
+      # libgtk-3-dev is deliberately absent: the tray library is resolved with
+      # dlopen at runtime, so the build must not need its headers. libfuse3-dev
+      # stays because its headers declare the callbacks; the shared object is
+      # loaded at runtime.
       # Ubuntu 22.04 ships GLFW 3.3, which lacks the Wayland application id and
       # the X11 class hints. Build 3.4 statically so the shipped binary is
       # self-contained and still sets its desktop identity.

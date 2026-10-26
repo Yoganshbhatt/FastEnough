@@ -9,9 +9,10 @@
 # matching checksum.
 #
 # Why a source build rather than a prebuilt tarball: the client links against
-# the system's libfuse3, GTK3, GLFW and OpenSSL. Building here uses exactly the
-# versions installed on the target machine, so there is no shared-library
-# version mismatch to work around.
+# the system's GLFW and OpenSSL. Building here uses exactly the versions
+# installed on the target machine, so there is no shared-library version
+# mismatch to work around. libfuse3 and GTK3 are both loaded at runtime and are
+# optional accordingly.
 
 pkgname=fast-enough
 pkgver=1.0.22
@@ -22,10 +23,11 @@ url="https://github.com/EkinStrop/FastEnough"
 license=('GPL-3.0-only')
 
 # android-tools provides adb, which the client looks up on PATH.
-depends=('glfw' 'gtk3' 'openssl' 'fontconfig' 'android-tools' 'hicolor-icon-theme')
-makedepends=('cmake' 'pkgconf' 'fuse3' 'git')
+depends=('glfw' 'openssl' 'fontconfig' 'android-tools' 'hicolor-icon-theme')
+makedepends=('cmake' 'pkgconf' 'git')
 # libfuse3 is loaded at runtime: mounting is optional.
-optdepends=('fuse3: mount device storage and MCRAW folders as a directory')
+optdepends=('fuse3: mount device storage and MCRAW folders as a directory'
+            'gtk3: system tray icon (libayatana-appindicator also required)')
 provides=('fast-enough')
 conflicts=('fast-enough')
 

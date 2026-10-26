@@ -31,20 +31,23 @@ Build:
 
 * CMake 3.20+, a C++20 compiler (GCC 13+ or Clang 16+), `pkg-config`.
 * GLFW 3.4+, OpenGL and OpenSSL headers.
-* `libfuse3` headers (optional; without them the mount action reports a clean
-  error), GTK3 headers (optional; enables the tray).
+* `libfuse3` headers (optional; without them the build omits the mount and
+  reports it at runtime). GTK3 headers are not needed: the tray library is
+  resolved at runtime.
 
 On Arch/CachyOS:
 
 ```bash
-sudo pacman -S --needed cmake gcc pkgconf glfw openssl gtk3 fuse3 zenity
+sudo pacman -S --needed cmake gcc pkgconf glfw openssl zenity
+# optional: fuse3 (mounting), gtk3 + libayatana-appindicator (tray icon)
 ```
 
 On Debian/Ubuntu:
 
 ```bash
 sudo apt install build-essential cmake pkg-config libglfw3-dev libgl1-mesa-dev \
-                 libssl-dev libfuse3-dev libgtk-3-dev zenity
+                 libssl-dev zenity
+# optional: libfuse3-dev (mounting), libgtk-3-dev (tray icon)
 ```
 
 ## Build and run
@@ -107,8 +110,8 @@ sudo pacman -Rns fast-enough
 ```
 
 The recipe builds from the checkout that contains it, so it always matches the
-sources you have. `fuse3` is an optional dependency: install it when you want to
-mount the device.
+sources you have. `fuse3` and `gtk3` are optional dependencies: install them
+when you want to mount the device or show a tray icon.
 
 The release tarball deliberately does not link against a distribution's
 `libfuse3`: its SONAME changed from `libfuse3.so.3` to `libfuse3.so.4` in
