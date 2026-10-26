@@ -1,0 +1,92 @@
+# Arch / CachyOS build recipe for the FastEnough Linux client.
+#
+#   git clone <repo> && cd <repo>/packaging/arch
+#   makepkg -si
+#
+# The recipe builds from the checkout that contains it, so the package always
+# matches the sources you are looking at. Publishing this to the AUR later only
+# requires replacing `source=()` with the release tarball URL and adding the
+# matching checksum.
+#
+# Why a source build rather than a prebuilt tarball: the client links against
+# the system's libfuse3, GTK3, GLFW and OpenSSL. Building here uses exactly the
+# versions installed on the target machine, so there is no shared-library
+# version mismatch to work around.
+
+pkgname=fast-enough
+pkgver=1.0.22
+pkgrel=1
+pkgdesc="Transfer files between this computer and Android devices over ADB"
+arch=('x86_64' 'aarch64')
+url="https://github.com/EkinStrop/FastEnough"
+license=('GPL-3.0-only')
+
+# android-tools provides adb, which the client looks up on PATH.
+depends=('glfw' 'gtk3' 'openssl' 'fontconfig' 'android-tools' 'hicolor-icon-theme')
+makedepends=('cmake' 'pkgconf' 'fuse3' 'git')
+# libfuse3 is loaded at runtime: mounting is optional.
+optdepends=('fuse3: mount device storage and MCRAW folders as a directory')
+provides=('fast-enough')
+conflicts=('fast-enough')
+
+srcroot="$(realpath "$startdir/../..")"
+
+if [[ ! -f "$srcroot/CMakeLists.txt" ]]; then
+    error "PKGBUILD must run from <repo>/packaging/arch (looked in $srcroot)"
+fi
+
+# Follow the newest tag in the checkout so local builds sort correctly.
+_upstream="$(git -C "$srcroot" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
+[[ -n "$_upstream" ]] && pkgver="$_upstream"
+
+source=()
+sha256sums=()
+
+build() {
+    cmake -S "$srcroot" -B "$srcdir/build" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DAFM_BUILD_GUI=ON \
+        -DAFM_REQUIRE_FUSE=ON
+    cmake --build "$srcdir/build" --parallel "$(nproc)"
+}
+
+package() {
+    local lib="/usr/lib/$pkgname"
+    local staging="$srcdir/build"
+
+    install -d "$pkgdir$lib" \
+               "$pkgdir/usr/bin" \
+               "$pkgdir/usr/share/applications" \
+               "$pkgdir/usr/share/icons/hicolor/256x256/apps" \
+               "$pkgdir/usr/share/doc/$pkgname"
+
+    # Binaries live together so the client finds afm-server and the on-device
+    # helper assets next to its own executable (/proc/self/exe).
+    install -m755 "$staging/fast-enough" "$pkgdir$lib/fast-enough"
+    install -m755 "$staging/afm-cli" "$pkgdir$lib/afm-cli"
+    install -m644 "$srcroot/server/afm-server" "$pkgdir$lib/afm-server"
+    install -m644 "$srcroot/server/afm-labels.dex" "$pkgdir$lib/afm-labels.dex"
+
+    ln -s "$lib/fast-enough" "$pkgdir/usr/bin/fast-enough"
+    ln -s "$lib/afm-cli" "$pkgdir/usr/bin/afm-cli"
+
+    install -m644 "$srcroot/res/app.png" \
+        "$pkgdir/usr/share/icons/hicolor/256x256/apps/fast-enough.png"
+
+    cat > "$pkgdir/usr/share/applications/fast-enough.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Fast Enough? - Android File Explorer
+Comment=Browse and transfer files with an Android device over ADB
+Exec=$lib/fast-enough %F
+Icon=fast-enough
+StartupWMClass=fast-enough
+Terminal=false
+Categories=Utility;FileManager;
+MimeType=application/vnd.android.package-archive;
+DESKTOP
+
+    install -m644 "$srcroot/LICENSE" "$pkgdir/usr/share/doc/$pkgname/LICENSE"
+    [[ -f "$srcroot/LINUX.md" ]] && \
+        install -m644 "$srcroot/LINUX.md" "$pkgdir/usr/share/doc/$pkgname/LINUX.md"
+}

@@ -59,3 +59,8 @@ build-release/
 
 # Local working notes (never shipped)
 AGENTS.md
+
+# makepkg build output (packaging/arch)
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*.pkg.tar.*
