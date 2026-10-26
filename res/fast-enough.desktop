@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Fast Enough? - Android File Explorer
+Comment=Browse and transfer files with an Android device over ADB
+Exec=fast-enough %F
+Icon=fast-enough
+StartupWMClass=fast-enough
+Terminal=false
+Categories=Utility;FileManager;
+MimeType=application/vnd.android.package-archive;

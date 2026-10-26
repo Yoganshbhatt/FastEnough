@@ -89,12 +89,26 @@ To build a tarball yourself:
 ```
 
 On Arch or CachyOS the repository also ships a `PKGBUILD` that builds against
-the system libraries:
+the distribution's own libraries:
 
 ```bash
+sudo pacman -S --needed base-devel        # once, if not already installed
 cd packaging/arch
 makepkg -si
 ```
+
+`makepkg -s` installs any missing dependencies from the repositories first, and
+`-i` installs the resulting package. It installs the binaries to
+`/usr/lib/fast-enough/` (they must sit next to `afm-server`), symlinks them into
+`/usr/bin/`, and registers the desktop entry and icon. Remove it with:
+
+```bash
+sudo pacman -Rns fast-enough
+```
+
+The recipe builds from the checkout that contains it, so it always matches the
+sources you have. `fuse3` is an optional dependency: install it when you want to
+mount the device.
 
 The release tarball deliberately does not link against a distribution's
 `libfuse3`: its SONAME changed from `libfuse3.so.3` to `libfuse3.so.4` in

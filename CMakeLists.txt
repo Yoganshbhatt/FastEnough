@@ -171,7 +171,31 @@ file(COPY ${CMAKE_SOURCE_DIR}/server/afm-labels.dex
 add_executable(afm-cli tools/afm_cli.cpp)
 target_link_libraries(afm-cli PRIVATE afm_client_core)
 
-install(TARGETS afm-cli RUNTIME DESTINATION bin)
+# --- Install layout -----------------------------------------------------------
+# The client looks for afm-server and afm-labels.dex next to its own executable
+# (/proc/self/exe), so the binaries are installed together in
+# <libdir>/fast-enough and <bindir> only carries symlinks. This is the single
+# definition of the installed layout: packaging/arch/PKGBUILD and
+# scripts/package-release.sh both end up with it.
+include(GNUInstallDirs)
+set(AFM_INSTALL_LIBDIR "${CMAKE_INSTALL_LIBDIR}/fast-enough")
+
+function(afm_install_bin_symlink name)
+  if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+    set(link_target "${AFM_INSTALL_LIBDIR}/${name}")
+  else()
+    set(link_target "../${AFM_INSTALL_LIBDIR}/${name}")
+  endif()
+  install(CODE "
+    file(MAKE_DIRECTORY \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
+    execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink
+      \"${link_target}\"
+      \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/${name}\")
+  ")
+endfunction()
+
+install(TARGETS afm-cli RUNTIME DESTINATION "${AFM_INSTALL_LIBDIR}")
+afm_install_bin_symlink(afm-cli)
 
 # --- GUI (Phase 2): shared App code + GLFW/OpenGL3 shell ----------------------
 # Build with: cmake -B build-gui -DAFM_BUILD_GUI=ON
@@ -218,10 +242,24 @@ if(GTK3_FOUND)
 else()
   message(STATUS "Tray: GTK3 not found; tray disabled")
 endif()
+
+install(TARGETS fast-enough RUNTIME DESTINATION "${AFM_INSTALL_LIBDIR}")
+afm_install_bin_symlink(fast-enough)
 endif()
+
 install(FILES ${CMAKE_SOURCE_DIR}/server/afm-server
               ${CMAKE_SOURCE_DIR}/server/afm-labels.dex
-        DESTINATION bin)
+        DESTINATION "${AFM_INSTALL_LIBDIR}")
+
+install(FILES ${CMAKE_SOURCE_DIR}/res/fast-enough.desktop
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+install(FILES ${CMAKE_SOURCE_DIR}/res/app.png
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/256x256/apps"
+        RENAME fast-enough.png)
+
+install(FILES ${CMAKE_SOURCE_DIR}/LICENSE
+              ${CMAKE_SOURCE_DIR}/LINUX.md
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/fast-enough")
 
 # --- Linux platform layer for the shared GUI code ----------------------------
 find_package(OpenSSL REQUIRED)

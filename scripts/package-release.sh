@@ -93,18 +93,8 @@ if [[ -f "$root/res/app.png" ]]; then
     cp "$root/res/app.png" "$stage/share/icons/hicolor/256x256/apps/fast-enough.png"
 fi
 
-cat > "$stage/share/applications/fast-enough.desktop" <<'DESKTOP'
-[Desktop Entry]
-Type=Application
-Name=Fast Enough? - Android File Explorer
-Comment=Browse and transfer files with an Android device over ADB
-Exec=fast-enough %F
-Icon=fast-enough
-StartupWMClass=fast-enough
-Terminal=false
-Categories=Utility;FileManager;
-MimeType=application/vnd.android.package-archive;
-DESKTOP
+install -Dm644 "$root/res/fast-enough.desktop" \
+    "$stage/share/applications/fast-enough.desktop"
 
 cat > "$stage/install.sh" <<'INSTALLER'
 #!/usr/bin/env bash
