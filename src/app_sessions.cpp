@@ -21,6 +21,8 @@ std::string App::deviceIdentity(const std::string& serial) const {
 }
 
 void App::discoverDeviceIdentities(const std::vector<DeviceInfo>& devices) {
+    std::vector<std::string> pending;
+    std::set<std::string> seen;
     for (const auto& device : devices) {
         if (m_shutdownPoll) return;
         if (device.state != "device" || !isWirelessAdbSerial(device.serial)) continue;
@@ -28,21 +30,32 @@ void App::discoverDeviceIdentities(const std::vector<DeviceInfo>& devices) {
             std::lock_guard<std::mutex> lock(m_identityMutex);
             if (m_deviceIdentities.count(device.serial)) continue;
         }
-        auto result = m_device.runAdbCommandResult("-s " + device.serial + " shell getprop ro.serialno", 2500);
-        if (!result.succeeded()) continue;
+        if (seen.insert(device.serial).second) pending.push_back(device.serial);
+    }
+    const std::string adbPath = m_device.getAdbPath();
+    runDeviceTasks(pending.size(), [&](size_t index) {
+        if (m_shutdownPoll) return;
+        const std::string& serial = pending[index];
+        DeviceClient probe;
+        probe.setOwnsServer(false);
+        probe.setAdbPath(adbPath);
+        auto result = probe.runAdbCommandResult("-s " + serial + " shell getprop ro.serialno", 2500,
+            [this]() { return m_shutdownPoll.load(); });
+        if (!result.succeeded()) return;
         std::string identity = result.standardOutput;
         auto end = identity.find_last_not_of(" \t\r\n");
         identity.resize(end == std::string::npos ? 0 : end + 1);
-        if (identity.empty() || identity == "unknown" || identity.find_first_of(" \t\r\n") != std::string::npos) continue;
+        if (identity.empty() || identity == "unknown" || identity.find_first_of(" \t\r\n") != std::string::npos) return;
         std::lock_guard<std::mutex> lock(m_identityMutex);
-        m_deviceIdentities[device.serial] = identity;
-    }
+        m_deviceIdentities[serial] = std::move(identity);
+    });
 }
 
 void App::cacheDeviceRoot(int slot) {
     auto& session = deviceSession(slot);
-    auto entries = session.client.listDirectory(session.storageRoot);
-    if (!session.client.isServerRunning()) return;
+    bool listed = false;
+    auto entries = session.client.listDirectory(session.storageRoot, &listed);
+    if (!listed) return;
     std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
         if (a.isDirectory() != b.isDirectory()) return a.isDirectory();
         return _stricmp(a.name.c_str(), b.name.c_str()) < 0;
@@ -103,7 +116,7 @@ void App::maintainDeviceSessions(const std::vector<DeviceInfo>& devices) {
         for (const auto& batch : m_batchQueue) {
             auto state = batch->state.load();
             if (batch->isLocalCopy) continue;
-            if (state == BatchState::Running || state == BatchState::Paused ||
+            if (state == BatchState::Preparing || state == BatchState::Running || state == BatchState::Paused ||
                 state == BatchState::Verifying || state == BatchState::WaitingConflict) {
                 busySessions.insert(batch->isPull ? batch->srcDeviceSlot : batch->dstDeviceSlot);
                 if (batch->isCrossDevice) {
@@ -113,25 +126,44 @@ void App::maintainDeviceSessions(const std::vector<DeviceInfo>& devices) {
             }
         }
     }
+    std::vector<std::pair<int, std::string>> pending;
+    bool needsHelper = false;
+    const auto now = std::chrono::steady_clock::now();
     for (int slot = 1; slot < deviceSessionCount() && !m_shutdownPoll; ++slot) {
         auto& session = deviceSession(slot);
-        const auto now = std::chrono::steady_clock::now();
         if (session.rootRequestPending) continue;
         if (busySessions.count(slot) || DeviceMountManager::instance(slot).ioActive) continue;
-        if (session.connected && session.client.isServerRunning() &&
-            now - session.lastHealthCheck >= std::chrono::seconds(15)) {
-            session.lastHealthCheck = now;
-            if (!session.client.verifyConnection()) {
-                session.connected = false;
+        const bool connected = session.connected && session.client.isServerRunning();
+        auto found = online.find(slot);
+        const bool canReconnect = found != online.end() && now >= session.retryAfter;
+        if (connected && now - session.lastHealthCheck < std::chrono::seconds(15)) continue;
+        if (!connected && !canReconnect) {
+            session.connected = false;
+            continue;
+        }
+        needsHelper = needsHelper || canReconnect;
+        pending.emplace_back(slot, canReconnect ? found->second : std::string{});
+    }
+    // Resource extraction uses a shared temporary file, so finish it before starting helpers.
+    if (needsHelper) m_device.getServerBinaryPath();
+    runDeviceTasks(pending.size(), [&](size_t index) {
+        if (m_shutdownPoll) return;
+        const auto& [slot, serial] = pending[index];
+        auto& session = deviceSession(slot);
+        try {
+            if (session.connected && session.client.isServerRunning()) {
+                session.lastHealthCheck = std::chrono::steady_clock::now();
+                if (session.client.verifyConnection()) return;
                 session.client.disconnectTcp();
             }
+            session.connected = false;
+            if (!serial.empty() && !m_shutdownPoll) prepareDeviceSession(slot, serial);
+        } catch (const std::exception& error) {
+            session.connected = false;
+            session.retryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+            LOG_WARN("Sessions", "Could not prepare " + session.serial + ": " + error.what());
         }
-        if (session.client.isServerRunning() && session.connected) continue;
-        session.connected = false;
-        auto found = online.find(slot);
-        if (found != online.end() && now >= session.retryAfter)
-            prepareDeviceSession(slot, found->second);
-    }
+    });
 }
 
 void App::rememberDeviceView(FilePanel& panel) {

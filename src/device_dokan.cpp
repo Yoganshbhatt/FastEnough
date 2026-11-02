@@ -36,6 +36,12 @@ struct WriteBuffer {
     }
 
     bool needsFlush() const { return buffer.size() >= FLUSH_SIZE || !sequential; }
+
+    bool canWrite(uint64_t offset, uint32_t len) const {
+        if (buffer.empty()) return true;
+        uint64_t end = fileOffset + buffer.size();
+        return offset == end || (offset >= fileOffset && offset <= end && len <= end - offset);
+    }
 };
 
 struct DokanContext {
@@ -47,34 +53,48 @@ struct DokanContext {
 
     // --- Directory listing cache ---
     struct CachedDir {
-        std::vector<DeviceFileEntry> entries;
+        std::shared_ptr<const std::vector<DeviceFileEntry>> entries;
         std::chrono::steady_clock::time_point fetchTime;
     };
     std::mutex dirMutex;
     std::unordered_map<std::string, CachedDir> dirCache;
+    uint64_t dirGeneration = 0;
 
-    const std::vector<DeviceFileEntry>* getDir(const std::string& path) {
-        std::lock_guard<std::mutex> lk(dirMutex);
+    std::shared_ptr<const std::vector<DeviceFileEntry>> getDir(const std::string& path) {
         auto now = std::chrono::steady_clock::now();
-        auto it = dirCache.find(path);
-        if (it != dirCache.end()) {
-            auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.fetchTime).count();
-            if (age < 5) return &it->second.entries;
+        uint64_t generation;
+        {
+            std::lock_guard<std::mutex> lk(dirMutex);
+            auto it = dirCache.find(path);
+            if (it != dirCache.end() && now - it->second.fetchTime < std::chrono::seconds(5))
+                return it->second.entries;
+            generation = dirGeneration;
         }
-        auto entries = device->listDirectory(path);
-        auto& cached = dirCache[path];
-        cached.entries = std::move(entries);
-        cached.fetchTime = now;
-        return &cached.entries;
+        bool succeeded = false;
+        auto listing = device->listDirectory(path, &succeeded);
+        if (!succeeded) return nullptr;
+        auto entries = std::make_shared<const std::vector<DeviceFileEntry>>(std::move(listing));
+        std::lock_guard<std::mutex> lk(dirMutex);
+        if (generation == dirGeneration && device->isServerRunning()) {
+            if (dirCache.size() >= 128 && dirCache.find(path) == dirCache.end()) {
+                auto oldest = std::min_element(dirCache.begin(), dirCache.end(),
+                    [](const auto& a, const auto& b) { return a.second.fetchTime < b.second.fetchTime; });
+                dirCache.erase(oldest);
+            }
+            dirCache[path] = {entries, std::chrono::steady_clock::now()};
+        }
+        return entries;
     }
 
     void invalidateDir(const std::string& path) {
         std::lock_guard<std::mutex> lk(dirMutex);
+        ++dirGeneration;
         dirCache.erase(path);
     }
 
     // Find a single entry by looking up parent dir (cached)
-    bool findEntry(const std::string& devPath, DeviceFileEntry& out) {
+    bool findEntry(const std::string& devPath, DeviceFileEntry& out, bool* succeeded = nullptr) {
+        if (succeeded) *succeeded = true;
         if (devPath == storageRoot) {
             out.name = "";
             out.type = 1; // dir
@@ -86,8 +106,11 @@ struct DokanContext {
         if (slash == std::string::npos) return false;
         std::string parentPath = devPath.substr(0, slash);
         std::string fileName = devPath.substr(slash + 1);
-        const auto* entries = getDir(parentPath);
-        if (!entries) return false;
+        const auto entries = getDir(parentPath);
+        if (!entries) {
+            if (succeeded) *succeeded = false;
+            return false;
+        }
         for (const auto& e : *entries) {
             if (e.name == fileName) { out = e; return true; }
         }
@@ -108,6 +131,18 @@ struct DokanContext {
     static constexpr int MAX_READ_CACHES = 4; // cache for up to 4 concurrent files
     std::mutex readMutex;
     std::vector<ReadCache> readCaches;
+    uint64_t readGeneration = 0;
+
+    void invalidateRead(const std::string& path) {
+        std::lock_guard<std::mutex> lk(readMutex);
+        ++readGeneration;
+        std::erase_if(readCaches, [&](const auto& entry) { return entry.path == path; });
+    }
+
+    uint64_t readVersion() {
+        std::lock_guard<std::mutex> lk(readMutex);
+        return readGeneration;
+    }
 
     // Try to serve a read from cache. Returns bytes served (0 = miss).
     uint64_t readFromCache(const std::string& path, uint64_t offset, uint32_t length, void* buffer) {
@@ -127,8 +162,10 @@ struct DokanContext {
     }
 
     // Store data in cache, evicting oldest if full
-    void cacheRead(const std::string& path, uint64_t offset, const void* data, size_t len) {
+    void cacheRead(const std::string& path, uint64_t offset, const void* data, size_t len,
+                   uint64_t generation) {
         std::lock_guard<std::mutex> lk(readMutex);
+        if (generation != readGeneration) return;
         // Update existing cache for this path
         for (auto& rc : readCaches) {
             if (rc.path == path) {
@@ -223,7 +260,9 @@ static NTSTATUS DOKAN_CALLBACK FsCreateFile(
 
     // Look up entry via cached directory listing
     DeviceFileEntry entry;
-    bool exists = ctx.findEntry(devPath, entry);
+    bool succeeded = false;
+    bool exists = ctx.findEntry(devPath, entry, &succeeded);
+    if (!succeeded) return STATUS_IO_DEVICE_ERROR;
     bool isDir = exists && entry.isDirectory();
 
     if (isDir) {
@@ -261,7 +300,8 @@ static NTSTATUS DOKAN_CALLBACK FsCreateFile(
         if (!exists || CreateDisposition == FILE_OVERWRITE ||
             CreateDisposition == FILE_OVERWRITE_IF ||
             CreateDisposition == FILE_SUPERSEDE) {
-            ctx.device->createFile(devPath, 0);
+            if (!ctx.device->createFile(devPath, 0)) return STATUS_ACCESS_DENIED;
+            ctx.invalidateRead(devPath);
             auto s = devPath.rfind('/');
             if (s != std::string::npos)
                 ctx.invalidateDir(devPath.substr(0, s));
@@ -270,9 +310,11 @@ static NTSTATUS DOKAN_CALLBACK FsCreateFile(
         // Register write buffer for batching
         {
             std::lock_guard<std::mutex> lk(ctx.writeMutex);
-            auto wb = std::make_unique<WriteBuffer>();
-            wb->devicePath = devPath;
-            ctx.writeBuffers[devPath] = std::move(wb);
+            auto& wb = ctx.writeBuffers[devPath];
+            if (!wb) {
+                wb = std::make_unique<WriteBuffer>();
+                wb->devicePath = devPath;
+            }
         }
 
         return STATUS_SUCCESS;
@@ -289,7 +331,9 @@ static NTSTATUS DOKAN_CALLBACK FsDeleteFile(LPCWSTR FileName, PDOKAN_FILE_INFO D
     // Just check if the file exists — actual deletion happens in Cleanup
     std::string devPath = toDevicePath(FileName, ctx);
     DeviceFileEntry entry;
-    if (!ctx.findEntry(devPath, entry)) return STATUS_OBJECT_NAME_NOT_FOUND;
+    bool succeeded = false;
+    if (!ctx.findEntry(devPath, entry, &succeeded))
+        return succeeded ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_IO_DEVICE_ERROR;
     return STATUS_SUCCESS;
 }
 
@@ -297,32 +341,44 @@ static NTSTATUS DOKAN_CALLBACK FsDeleteDirectory(LPCWSTR FileName, PDOKAN_FILE_I
     CTX;
     std::string devPath = toDevicePath(FileName, ctx);
     DeviceFileEntry entry;
-    if (!ctx.findEntry(devPath, entry)) return STATUS_OBJECT_NAME_NOT_FOUND;
+    bool succeeded = false;
+    if (!ctx.findEntry(devPath, entry, &succeeded))
+        return succeeded ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_IO_DEVICE_ERROR;
     if (!entry.isDirectory()) return STATUS_NOT_A_DIRECTORY;
     return STATUS_SUCCESS;
 }
 
 // Flush a write buffer to the device (caller holds ctx.writeMutex or has exclusive access)
-static void flushWriteBuffer(DokanContext& ctx, WriteBuffer* wb) {
-    if (!wb || wb->buffer.empty()) return;
+static bool flushWriteBuffer(DokanContext& ctx, WriteBuffer* wb) {
+    if (!wb || wb->buffer.empty()) return true;
     DeviceMountManager::instance(ctx.slot).ioActive = true;
-    ctx.device->writeRange(wb->devicePath, wb->fileOffset,
+    uint64_t written = ctx.device->writeRange(wb->devicePath, wb->fileOffset,
                               wb->buffer.data(), (uint32_t)wb->buffer.size());
     DeviceMountManager::instance(ctx.slot).ioActive = false;
+    ctx.invalidateRead(wb->devicePath);
+    if (written != wb->buffer.size()) return false;
     wb->buffer.clear();
+    wb->sequential = true;
+    return true;
 }
 
 // Flush and remove write buffer for a device path
 static void flushAndRemoveWriteBuffer(DokanContext& ctx, const std::string& devPath) {
-    std::unique_ptr<WriteBuffer> wb;
-    {
-        std::lock_guard<std::mutex> lk(ctx.writeMutex);
-        auto it = ctx.writeBuffers.find(devPath);
-        if (it == ctx.writeBuffers.end()) return;
-        wb = std::move(it->second);
-        ctx.writeBuffers.erase(it);
-    }
-    flushWriteBuffer(ctx, wb.get());
+    std::lock_guard<std::mutex> lk(ctx.writeMutex);
+    auto it = ctx.writeBuffers.find(devPath);
+    if (it == ctx.writeBuffers.end()) return;
+    if (!flushWriteBuffer(ctx, it->second.get()))
+        LOG_ERROR("Dokan", "Failed to flush file: " + devPath);
+    ctx.writeBuffers.erase(it);
+}
+
+static NTSTATUS DOKAN_CALLBACK FsFlushFileBuffers(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
+    CTX;
+    std::string devPath = toDevicePath(FileName, ctx);
+    std::lock_guard<std::mutex> lk(ctx.writeMutex);
+    auto it = ctx.writeBuffers.find(devPath);
+    return it == ctx.writeBuffers.end() || flushWriteBuffer(ctx, it->second.get())
+        ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
 }
 
 static void DOKAN_CALLBACK FsCleanup(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
@@ -331,6 +387,7 @@ static void DOKAN_CALLBACK FsCleanup(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFil
     if (FileName) {
         std::string devPath = toDevicePath(FileName, ctx);
         flushAndRemoveWriteBuffer(ctx, devPath);
+        ctx.invalidateRead(devPath);
         // Invalidate parent dir cache
         auto slash = devPath.rfind('/');
         if (slash != std::string::npos)
@@ -355,14 +412,29 @@ static void DOKAN_CALLBACK FsCloseFile(LPCWSTR, PDOKAN_FILE_INFO DokanFileInfo) 
 }
 
 static NTSTATUS DOKAN_CALLBACK FsSetEndOfFile(
-    LPCWSTR FileName, LONGLONG ByteOffset, PDOKAN_FILE_INFO) {
-    // Accept silently — the file on device will be the right size after writes
-    return STATUS_SUCCESS;
+    LPCWSTR FileName, LONGLONG ByteOffset, PDOKAN_FILE_INFO DokanFileInfo) {
+    CTX;
+    if (ByteOffset < 0) return STATUS_INVALID_PARAMETER;
+    if (DokanFileInfo->IsDirectory) return STATUS_FILE_IS_A_DIRECTORY;
+    std::string path = toDevicePath(FileName, ctx);
+    std::lock_guard<std::mutex> lock(ctx.writeMutex);
+    auto writer = ctx.writeBuffers.find(path);
+    if (writer != ctx.writeBuffers.end() && !flushWriteBuffer(ctx, writer->second.get()))
+        return STATUS_IO_DEVICE_ERROR;
+    DokanResetTimeout(60000, DokanFileInfo);
+    DeviceMountManager::instance(ctx.slot).ioActive = true;
+    bool resized = ctx.device->truncateFile(path, (uint64_t)ByteOffset);
+    DeviceMountManager::instance(ctx.slot).ioActive = false;
+    ctx.invalidateRead(path);
+    auto slash = path.rfind('/');
+    if (slash != std::string::npos) ctx.invalidateDir(path.substr(0, slash));
+    return resized ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
 }
 
 static NTSTATUS DOKAN_CALLBACK FsSetAllocationSize(
     LPCWSTR FileName, LONGLONG AllocSize, PDOKAN_FILE_INFO) {
-    return STATUS_SUCCESS;
+    if (AllocSize < 0) return STATUS_INVALID_PARAMETER;
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 static NTSTATUS DOKAN_CALLBACK FsSetFileAttributes(
@@ -386,11 +458,15 @@ static NTSTATUS DOKAN_CALLBACK FsMoveFile(
     std::string oldPath = toDevicePath(FileName, ctx);
     std::string newPath = toDevicePath(NewFileName, ctx);
 
+    if (FsFlushFileBuffers(FileName, DokanFileInfo) != STATUS_SUCCESS) return STATUS_IO_DEVICE_ERROR;
+
     DeviceMountManager::instance(ctx.slot).ioActive = true;
     bool ok = ctx.device->renameFile(oldPath, newPath);
     DeviceMountManager::instance(ctx.slot).ioActive = false;
 
     if (!ok) return STATUS_ACCESS_DENIED;
+    ctx.invalidateRead(oldPath);
+    ctx.invalidateRead(newPath);
 
     // Invalidate both parent dir caches
     auto s1 = oldPath.rfind('/');
@@ -407,6 +483,10 @@ static NTSTATUS DOKAN_CALLBACK FsWriteFile(
 {
     CTX;
     std::string devPath = toDevicePath(FileName, ctx);
+    *NumberOfBytesWritten = 0;
+    if (Offset < 0) return STATUS_INVALID_PARAMETER;
+    if (NumberOfBytesToWrite == 0) return STATUS_SUCCESS;
+    ctx.invalidateRead(devPath);
 
     // Try buffered write
     {
@@ -416,16 +496,16 @@ static NTSTATUS DOKAN_CALLBACK FsWriteFile(
             auto* wb = it->second.get();
 
             // Flush if needed before writing
-            if (wb->needsFlush() && !wb->buffer.empty()) {
+            if (!wb->buffer.empty() && (wb->needsFlush() || !wb->canWrite((uint64_t)Offset, NumberOfBytesToWrite))) {
                 DokanResetTimeout(60000, DokanFileInfo);
-                flushWriteBuffer(ctx, wb);
+                if (!flushWriteBuffer(ctx, wb)) return STATUS_IO_DEVICE_ERROR;
             }
 
             wb->write((uint64_t)Offset, Buffer, NumberOfBytesToWrite);
 
             if (wb->needsFlush()) {
                 DokanResetTimeout(60000, DokanFileInfo);
-                flushWriteBuffer(ctx, wb);
+                if (!flushWriteBuffer(ctx, wb)) return STATUS_IO_DEVICE_ERROR;
             }
 
             *NumberOfBytesWritten = NumberOfBytesToWrite;
@@ -434,6 +514,7 @@ static NTSTATUS DOKAN_CALLBACK FsWriteFile(
     }
 
     // Fallback: direct write
+    std::lock_guard<std::mutex> writeLock(ctx.writeMutex);
     DeviceMountManager::instance(ctx.slot).ioActive = true;
     DokanResetTimeout(60000, DokanFileInfo);
 
@@ -456,6 +537,10 @@ static NTSTATUS DOKAN_CALLBACK FsReadFile(
 {
     CTX;
     std::string devPath = toDevicePath(FileName, ctx);
+    *ReadLength = 0;
+    if (Offset < 0) return STATUS_INVALID_PARAMETER;
+    if (BufferLength == 0) return STATUS_SUCCESS;
+    if (FsFlushFileBuffers(FileName, DokanFileInfo) != STATUS_SUCCESS) return STATUS_IO_DEVICE_ERROR;
 
     // Try cache first
     uint64_t cached = ctx.readFromCache(devPath, (uint64_t)Offset, BufferLength, Buffer);
@@ -471,6 +556,7 @@ static NTSTATUS DOKAN_CALLBACK FsReadFile(
     // This dramatically reduces round-trips for sequential reads
     uint64_t fetchSize = (BufferLength > DokanContext::READ_AHEAD_SIZE) ? BufferLength : DokanContext::READ_AHEAD_SIZE;
     std::vector<char> fetchBuf(fetchSize);
+    uint64_t generation = ctx.readVersion();
 
     uint64_t bytesRead = ctx.device->readRange(devPath, (uint64_t)Offset, (uint64_t)fetchSize, fetchBuf.data());
 
@@ -482,7 +568,7 @@ static NTSTATUS DOKAN_CALLBACK FsReadFile(
     }
 
     // Cache the full fetched chunk
-    ctx.cacheRead(devPath, (uint64_t)Offset, fetchBuf.data(), (size_t)bytesRead);
+    ctx.cacheRead(devPath, (uint64_t)Offset, fetchBuf.data(), (size_t)bytesRead, generation);
 
     // Return only what was requested
     uint32_t toReturn = (uint32_t)(BufferLength < bytesRead ? BufferLength : bytesRead);
@@ -499,8 +585,9 @@ static NTSTATUS DOKAN_CALLBACK FsGetFileInformation(
     memset(Buffer, 0, sizeof(*Buffer));
 
     DeviceFileEntry e;
-    if (!ctx.findEntry(devPath, e))
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+    bool succeeded = false;
+    if (!ctx.findEntry(devPath, e, &succeeded))
+        return succeeded ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_IO_DEVICE_ERROR;
 
     Buffer->dwFileAttributes = e.isDirectory() ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
     if (!e.isDirectory()) {
@@ -520,8 +607,8 @@ static NTSTATUS DOKAN_CALLBACK FsFindFiles(
 {
     CTX;
     std::string devPath = toDevicePath(FileName, ctx);
-    const auto* entries = ctx.getDir(devPath);
-    if (!entries) return STATUS_OBJECT_PATH_NOT_FOUND;
+    const auto entries = ctx.getDir(devPath);
+    if (!entries) return STATUS_IO_DEVICE_ERROR;
 
     for (const auto& e : *entries) {
         WIN32_FIND_DATAW findData = {};
@@ -605,6 +692,9 @@ bool DeviceMountManager::mount(DeviceClient* device, const std::string& storageR
 
     contextForSlot(m_slot).device = device;
     contextForSlot(m_slot).storageRoot = storageRoot;
+    contextForSlot(m_slot).dirCache.clear();
+    contextForSlot(m_slot).readCaches.clear();
+    contextForSlot(m_slot).writeBuffers.clear();
     m_mountPoint = mountPoint;
 
     // Convert mount point to wide string
@@ -627,6 +717,7 @@ bool DeviceMountManager::mount(DeviceClient* device, const std::string& storageR
         ops.CloseFile = FsCloseFile;
         ops.ReadFile = FsReadFile;
         ops.WriteFile = FsWriteFile;
+        ops.FlushFileBuffers = FsFlushFileBuffers;
         ops.DeleteFile = FsDeleteFile;
         ops.DeleteDirectory = FsDeleteDirectory;
         ops.SetEndOfFile = FsSetEndOfFile;

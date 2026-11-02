@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <cstdio>
+#include <cwctype>
 
 #pragma comment(lib, "ProjectedFSLib.lib")
 
@@ -38,15 +39,25 @@ struct MountContext {
     std::vector<motioncam::Timestamp> frames;
 
     std::vector<VirtualEntry> entries; // cached listing
+    std::unordered_map<std::wstring, size_t> entryIndex;
     std::mutex cacheMutex;
-    std::unordered_map<int, std::vector<uint8_t>> dngCache; // frameIndex -> DNG bytes
+    std::mutex decoderMutex;
+    struct CachedFrame {
+        std::shared_ptr<const std::vector<uint8_t>> data;
+        uint64_t lastAccess = 0;
+    };
+    std::unordered_map<int, CachedFrame> dngCache;
+    size_t cachedBytes = 0;
+    uint64_t cacheClock = 0;
+    static constexpr size_t MAX_CACHE_BYTES = 256 * 1024 * 1024;
+    static constexpr size_t MAX_CACHE_FRAMES = 8;
 
     // Audio cache
-    std::vector<uint8_t> audioCache;
-    bool audioGenerated = false;
+    std::shared_ptr<const std::vector<uint8_t>> audioCache;
 
     // Metadata cache
     std::string metadataJson;
+    std::shared_ptr<const std::vector<uint8_t>> metadataBytes;
 
     PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT virtContext = nullptr;
 };
@@ -111,62 +122,55 @@ static const VirtualEntry* findEntry(MountContext* ctx, const std::wstring& rela
     // Also strip trailing backslash
     if (!name.empty() && name.back() == L'\\') name.pop_back();
 
-    for (auto& e : ctx->entries) {
-        if (_wcsicmp(e.name.c_str(), name.c_str()) == 0) return &e;
-    }
-    return nullptr;
+    std::transform(name.begin(), name.end(), name.begin(), towlower);
+    auto it = ctx->entryIndex.find(name);
+    return it == ctx->entryIndex.end() ? nullptr : &ctx->entries[it->second];
 }
 
-// Get or generate file data for a virtual entry, returns pointer to cached data
-static const std::vector<uint8_t>* getFileData(MountContext* ctx, const VirtualEntry* entry) {
-    if (entry->kind == VirtualEntry::METADATA) {
-        // Already cached as string during init
-        // Return as byte vector — use a static trick with the string
-        static thread_local std::vector<uint8_t> metaBuf;
-        metaBuf.assign(ctx->metadataJson.begin(), ctx->metadataJson.end());
-        return &metaBuf;
-    }
+static std::shared_ptr<const std::vector<uint8_t>> getFileData(MountContext* ctx, const VirtualEntry* entry) {
+    if (entry->kind == VirtualEntry::METADATA) return ctx->metadataBytes;
 
-    if (entry->kind == VirtualEntry::AUDIO) {
-        std::lock_guard<std::mutex> lk(ctx->cacheMutex);
-        if (!ctx->audioGenerated) {
-            if (!generateWavInMemory(ctx, ctx->audioCache)) return nullptr;
-            ctx->audioGenerated = true;
-        }
-        return &ctx->audioCache;
-    }
-
-    if (entry->kind == VirtualEntry::FRAME) {
-        std::lock_guard<std::mutex> lk(ctx->cacheMutex);
+    auto cached = [&]() -> std::shared_ptr<const std::vector<uint8_t>> {
+        std::lock_guard<std::mutex> lock(ctx->cacheMutex);
+        if (entry->kind == VirtualEntry::AUDIO) return ctx->audioCache;
         auto it = ctx->dngCache.find(entry->frameIndex);
-        if (it != ctx->dngCache.end()) return &it->second;
+        if (it == ctx->dngCache.end()) return nullptr;
+        it->second.lastAccess = ++ctx->cacheClock;
+        return it->second.data;
+    };
+    if (auto data = cached()) return data;
 
-        // Generate DNG
-        std::vector<uint8_t> dng;
-        if (!generateDngInMemory(ctx, entry->frameIndex, dng)) return nullptr;
-
-        // Cache it (evict old entries if cache gets too large — keep last 8 frames)
-        if (ctx->dngCache.size() > 8) {
-            // Find the entry with the lowest frame index distance from current
-            int curIdx = entry->frameIndex;
-            int worstKey = -1;
-            int worstDist = 0;
-            for (auto& [k, v] : ctx->dngCache) {
-                int dist = std::abs(k - curIdx);
-                if (dist > worstDist) { worstDist = dist; worstKey = k; }
-            }
-            if (worstKey >= 0) ctx->dngCache.erase(worstKey);
+    std::lock_guard<std::mutex> decoderLock(ctx->decoderMutex);
+    if (auto data = cached()) return data;
+    auto data = std::make_shared<std::vector<uint8_t>>();
+    if (entry->kind == VirtualEntry::AUDIO) {
+        if (!generateWavInMemory(ctx, *data)) return nullptr;
+        std::lock_guard<std::mutex> lock(ctx->cacheMutex);
+        ctx->audioCache = data;
+    } else if (entry->kind == VirtualEntry::FRAME) {
+        if (!generateDngInMemory(ctx, entry->frameIndex, *data)) return nullptr;
+        std::lock_guard<std::mutex> lock(ctx->cacheMutex);
+        while (!ctx->dngCache.empty() &&
+               (ctx->dngCache.size() >= MountContext::MAX_CACHE_FRAMES ||
+                data->size() > MountContext::MAX_CACHE_BYTES - ctx->cachedBytes)) {
+            auto oldest = std::min_element(ctx->dngCache.begin(), ctx->dngCache.end(),
+                [](const auto& a, const auto& b) { return a.second.lastAccess < b.second.lastAccess; });
+            ctx->cachedBytes -= oldest->second.data->size();
+            ctx->dngCache.erase(oldest);
         }
-
-        auto [ins, _] = ctx->dngCache.emplace(entry->frameIndex, std::move(dng));
-        return &ins->second;
+        if (data->size() <= MountContext::MAX_CACHE_BYTES) {
+            ctx->cachedBytes += data->size();
+            ctx->dngCache.emplace(entry->frameIndex, MountContext::CachedFrame{data, ++ctx->cacheClock});
+        }
+    } else {
+        return nullptr;
     }
-
-    return nullptr;
+    return data;
 }
 
 // Directory enumeration state
 struct EnumSession {
+    MountContext* context = nullptr;
     std::vector<const VirtualEntry*> sorted;
     size_t index = 0;
     bool filled = false;
@@ -184,16 +188,11 @@ static HRESULT CALLBACK cb_StartDirEnum(
 {
     auto* ctx = (MountContext*)cbd->InstanceContext;
     auto session = std::make_unique<EnumSession>();
+    session->context = ctx;
 
     // Root listing: add all entries
     for (auto& e : ctx->entries)
         session->sorted.push_back(&e);
-
-    // Sort by ProjFS file name comparison
-    std::sort(session->sorted.begin(), session->sorted.end(),
-        [](const VirtualEntry* a, const VirtualEntry* b) {
-            return PrjFileNameCompare(a->name.c_str(), b->name.c_str()) < 0;
-        });
 
     std::lock_guard<std::mutex> lk(g_enumMutex);
     g_enumSessions[*enumId] = std::move(session);
@@ -261,10 +260,11 @@ static HRESULT CALLBACK cb_GetPlaceholderInfo(
 
     uint64_t fileSize = entry->size;
 
-    // For audio, generate the WAV on first placeholder request to get exact size
-    if (entry->kind == VirtualEntry::AUDIO) {
-        const auto* data = getFileData(ctx, entry);
-        if (data) fileSize = data->size();
+    // Frame metadata can change the DNG trailer size between frames.
+    if (entry->kind == VirtualEntry::FRAME) {
+        const auto data = getFileData(ctx, entry);
+        if (!data) return HRESULT_FROM_WIN32(ERROR_READ_FAULT);
+        fileSize = data->size();
     }
 
     PRJ_PLACEHOLDER_INFO placeholderInfo = {};
@@ -287,11 +287,11 @@ static HRESULT CALLBACK cb_GetFileData(
     const VirtualEntry* entry = findEntry(ctx, cbd->FilePathName);
     if (!entry) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
 
-    const auto* data = getFileData(ctx, entry);
+    const auto data = getFileData(ctx, entry);
     if (!data) return HRESULT_FROM_WIN32(ERROR_READ_FAULT);
 
     // Clamp to actual data size
-    if (byteOffset >= data->size()) return S_OK;
+    if (length == 0 || byteOffset >= data->size()) return S_OK;
     uint64_t available = data->size() - byteOffset;
     uint32_t toWrite = (uint32_t)std::min((uint64_t)length, available);
 
@@ -324,6 +324,10 @@ void McrawMount::unmount() {
 
         // Delete the MountContext (closes the decoder's FILE* handle on the MCRAW file)
         if (m_mountContext) {
+            std::lock_guard<std::mutex> lock(g_enumMutex);
+            std::erase_if(g_enumSessions, [&](const auto& entry) {
+                return entry.second->context == m_mountContext;
+            });
             delete (MountContext*)m_mountContext;
             m_mountContext = nullptr;
         }
@@ -347,6 +351,8 @@ std::shared_ptr<McrawMount> McrawMount::mount(const std::string& mcrawPath, std:
         ctx->containerMeta = ctx->decoder->getContainerMetadata();
         ctx->frames = ctx->decoder->getFrames(); // copy
         ctx->metadataJson = ctx->containerMeta.dump(2);
+        ctx->metadataBytes = std::make_shared<const std::vector<uint8_t>>(
+            ctx->metadataJson.begin(), ctx->metadataJson.end());
     } catch (const std::exception& e) {
         LOG_ERROR("MCRAW", "Failed to open MCRAW: " + std::string(e.what()));
         delete ctx;
@@ -372,7 +378,11 @@ std::shared_ptr<McrawMount> McrawMount::mount(const std::string& mcrawPath, std:
                 dngExactSize = firstDng.size();
                 // Cache it so we don't regenerate on first read
                 std::lock_guard<std::mutex> lk(ctx->cacheMutex);
-                ctx->dngCache[0] = std::move(firstDng);
+                if (firstDng.size() <= MountContext::MAX_CACHE_BYTES) {
+                    ctx->cachedBytes = firstDng.size();
+                    ctx->dngCache[0] = {std::make_shared<const std::vector<uint8_t>>(std::move(firstDng)),
+                                        ++ctx->cacheClock};
+                }
             }
         } catch (...) {}
     }
@@ -389,7 +399,7 @@ std::shared_ptr<McrawMount> McrawMount::mount(const std::string& mcrawPath, std:
         ctx->entries.push_back(std::move(e));
     }
 
-    // Audio entry — estimate size from metadata without loading all chunks
+    // Audio sizes come from indexed chunk headers without loading PCM data.
     try {
         if (ctx->containerMeta.contains("extraData") &&
             ctx->containerMeta["extraData"].contains("audioSampleRate") &&
@@ -397,18 +407,23 @@ std::shared_ptr<McrawMount> McrawMount::mount(const std::string& mcrawPath, std:
             int sr = ctx->containerMeta["extraData"]["audioSampleRate"];
             int ch = ctx->containerMeta["extraData"]["audioChannels"];
             if (sr > 0 && ch > 0) {
-                // Rough estimate: assume audio duration ~ video duration
-                // frames / 30fps * sampleRate * channels * 2 bytes
-                double durationSec = ctx->frames.size() / 30.0;
-                uint64_t estAudioSize = 44 + (uint64_t)(durationSec * sr * ch * sizeof(int16_t));
-                VirtualEntry e;
-                e.name = L"audio.wav";
-                e.size = estAudioSize; // exact size resolved on first read
-                e.kind = VirtualEntry::AUDIO;
-                ctx->entries.push_back(std::move(e));
+                uint64_t audioBytes = ctx->decoder->audioSizeBytes();
+                if (audioBytes > 0) {
+                    VirtualEntry e;
+                    e.name = L"audio.wav";
+                    e.size = 44 + audioBytes;
+                    e.kind = VirtualEntry::AUDIO;
+                    ctx->entries.push_back(std::move(e));
+                }
             }
         }
     } catch (...) {}
+
+    std::sort(ctx->entries.begin(), ctx->entries.end(), [](const auto& a, const auto& b) {
+        return PrjFileNameCompare(a.name.c_str(), b.name.c_str()) < 0;
+    });
+    for (size_t i = 0; i < ctx->entries.size(); ++i)
+        ctx->entryIndex.emplace(ctx->entries[i].name, i);
 
     // Create mount directory
     char tmpDir[MAX_PATH];

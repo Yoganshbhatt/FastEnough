@@ -2,6 +2,7 @@
 #include "ui_widgets.h"
 #include "ui_panels.h"
 #include "local_copy.h"
+#include "local_directory.h"
 #include "backup_archive.h"
 #include "imgui_internal.h"
 #include "mcraw_local.h"
@@ -1029,6 +1030,33 @@ void App::performAndroidDragOut(FilePanel* src) {
     worker.detach();
 }
 
+static bool probeTcpEndpoint(const std::string& ip, int port) {
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons((u_short)port);
+    if (inet_pton(AF_INET, ip.c_str(), &address.sin_addr) != 1) return false;
+    SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (probe == INVALID_SOCKET) return false;
+    unsigned long nonblocking = 1;
+    bool connected = false;
+    if (ioctlsocket(probe, FIONBIO, &nonblocking) == 0) {
+        int result = connect(probe, (sockaddr*)&address, sizeof(address));
+        if (result == 0) connected = true;
+        else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            fd_set writable, failed;
+            FD_ZERO(&writable); FD_SET(probe, &writable);
+            FD_ZERO(&failed); FD_SET(probe, &failed);
+            timeval timeout{1, 0};
+            int error = 0, size = sizeof(error);
+            connected = select(0, nullptr, &writable, &failed, &timeout) > 0 &&
+                FD_ISSET(probe, &writable) &&
+                getsockopt(probe, SOL_SOCKET, SO_ERROR, (char*)&error, &size) == 0 && error == 0;
+        }
+    }
+    closesocket(probe);
+    return connected;
+}
+
 static bool isWifiSerial(const std::string& serial) {
     return isWirelessAdbSerial(serial);
 }
@@ -1440,12 +1468,18 @@ App::App() {
 App::~App() {
     m_shutdownTransfer = true;
     m_shutdownPoll = true;
+    {
+        std::lock_guard<std::mutex> lock(m_batchMutex);
+        for (const auto& batch : m_batchQueue) batch->requestStop();
+    }
     ++m_pairingGeneration;
     if (m_pairingThread.joinable()) m_pairingThread.join();
     for (int slot = 0; slot < deviceSessionCount(); ++slot) deviceForSlot(slot).cancelCommands();
     m_secondaryChannel.cancelCommands();
     m_batchCV.notify_all();
     m_asyncCV.notify_all();
+    m_listingWork.stop();
+    m_manifestWork.stop();
     if (m_batchThread.joinable()) m_batchThread.join();
     if (m_pollThread.joinable()) m_pollThread.join();
     if (m_asyncThread.joinable()) m_asyncThread.join();
@@ -1539,6 +1573,28 @@ void App::postUiMessage(UiMessage message) {
     m_uiMessages.push_back(std::move(message));
 }
 
+void App::postListing(FilePanel* panel, std::function<void()> action) {
+    const auto generation = panel->listingGeneration;
+    m_listingWork.post(reinterpret_cast<uintptr_t>(panel), [this, panel, generation, action = std::move(action)] {
+        if (m_shutdownPoll) return;
+        try {
+            action();
+        } catch (const std::exception& error) {
+            UiMessage message;
+            message.listingPanel = panel;
+            message.listingGeneration = generation;
+            message.listingError = error.what();
+            postUiMessage(std::move(message));
+        } catch (...) {
+            UiMessage message;
+            message.listingPanel = panel;
+            message.listingGeneration = generation;
+            message.listingError = "Unexpected folder loading failure";
+            postUiMessage(std::move(message));
+        }
+    });
+}
+
 void App::drainUiMessages() {
     std::deque<UiMessage> messages;
     {
@@ -1547,14 +1603,44 @@ void App::drainUiMessages() {
     }
 
     for (auto& message : messages) {
+        if (message.preparedBatch) {
+            auto& batch = message.preparedBatch;
+            if (batch->stopRequested) batch->state = BatchState::Stopped;
+            else if (!message.preparationError.empty()) {
+                batch->errorMessage = std::move(message.preparationError);
+                batch->state = BatchState::Failed;
+                batch->logEvent(LogLevel::Error, "Source scan failed: " + batch->errorMessage);
+            } else {
+                batch->files = std::move(message.preparedFiles);
+                batch->totalBytes = message.preparedBytes;
+                batch->logQueued();
+                batch->state = BatchState::Queued;
+                m_batchCV.notify_one();
+            }
+        }
+        if (message.mountedPanel && message.mountedPanel->listingGeneration == message.mountedGeneration &&
+            !message.mountedPanel->isAndroid && !message.mountedPath.empty()) {
+            message.mountedPanel->insideMcraw = true;
+            message.mountedPanel->mcrawFilePath = message.mountedSource;
+            navigateToDirectory(*message.mountedPanel, message.mountedPath);
+        }
         if (message.listingPanel) {
             FilePanel& panel = *message.listingPanel;
             if (panel.listingGeneration == message.listingGeneration) {
                 panel.refreshInProgress = false;
+                if (!message.listingError.empty()) {
+                    m_statusMessage = "Cannot load folder: " + message.listingError;
+                    m_statusTime = std::chrono::steady_clock::now();
+                    LOG_WARN("Files", m_statusMessage);
+                    continue;
+                }
                 if (panel.pendingDeviceSerial.empty() && panel.deviceSlot == message.listingSlot &&
-                    (message.listingApps ? panel.isApps : panel.isAndroid && panel.currentPath == message.listingPath)) {
+                    (message.listingApps ? panel.isApps : !panel.isApps && !panel.isConnections &&
+                        panel.isAndroid != message.listingWindows && panel.currentPath == message.listingPath)) {
                     if (message.listingApps) panel.appEntries = std::move(message.listingAppEntries);
+                    else if (message.listingWindows) panel.windowsEntries = std::move(message.listingWindowsEntries);
                     else panel.androidEntries = std::move(message.listingEntries);
+                    ++panel.entriesRevision;
                     panel.selectedIndices.clear();
                     strcpy_s(panel.pathInput, message.listingApps ? "Installed apps" : panel.currentPath.c_str());
                     if (panel.navigationTransitionPending) {
@@ -1867,6 +1953,7 @@ bool App::modernSmallButton(const char* label) {
 void App::render() {
     ImGuiIO& io = ImGui::GetIO();
     drainUiMessages();
+    updateTransferPresentation();
 
     if (m_theme.mode == 0) {
         auto themeNow = std::chrono::steady_clock::now();
@@ -1940,14 +2027,7 @@ void App::render() {
                 std::string mcrawFullPath = focused->currentPath;
                 appendPathSeparator(mcrawFullPath, '\\');
                 mcrawFullPath += name;
-                postAsync("Mounting MCRAW...", [this, mcrawFullPath, focused]() {
-                    std::string mountPath = McrawMountManager::instance().mountMcraw(mcrawFullPath);
-                    if (!mountPath.empty()) {
-                        focused->insideMcraw = true;
-                        focused->mcrawFilePath = mcrawFullPath;
-                        navigateToDirectory(*focused, mountPath);
-                    }
-                });
+                requestMcrawMount(*focused, mcrawFullPath);
             } else if (endsWithCI(name, ".mcraw") && focused->isAndroid) {
                 std::string np = focused->currentPath;
                 appendPathSeparator(np, '/');
@@ -2049,12 +2129,12 @@ void App::render() {
             FilePanel* targetPanel = &panel;
             int slot = panel.deviceSlot;
             std::string expectedSerial = (slot >= 0 && slot < deviceSessionCount()) ? deviceSession(slot).serial : "";
-            postAsync("Loading installed apps...", [this, targetPanel, slot, expectedSerial, generation, col, desc]() {
+            postListing(targetPanel, [this, targetPanel, slot, expectedSerial, generation, col, desc]() {
                 std::vector<InstalledAppEntry> apps;
-                DeviceClient& dev = deviceForSlot(slot);
-                if (dev.isServerRunning()) {
-                    std::string serial = deviceSession(slot).serial;
-                    apps = dev.listInstalledApps(serial, true);
+                DeviceClient dev;
+                dev.setAdbPath(deviceForSlot(slot).getAdbPath());
+                if (!expectedSerial.empty()) {
+                    apps = dev.listInstalledApps(expectedSerial, true);
                     std::sort(apps.begin(), apps.end(),
                         [col, desc](const InstalledAppEntry& a, const InstalledAppEntry& b) {
                             int cmp = 0;
@@ -2091,14 +2171,18 @@ void App::render() {
             std::string path = panel.currentPath;
             bool insideMcraw = panel.insideMcraw;
             std::string mcrawPath = panel.mcrawFilePath;
-            postAsync("Loading folder...", [this, targetPanel, slot, path, insideMcraw, mcrawPath, generation, col, desc]() {
+            postListing(targetPanel, [this, targetPanel, slot, path, insideMcraw, mcrawPath, generation, col, desc]() {
                 std::vector<DeviceFileEntry> entries;
-                DeviceClient& dev = deviceForSlot(slot);
-                if (dev.isServerRunning()) {
+                DeviceClient dev;
+                if (dev.connectParallelFrom(deviceForSlot(slot))) {
                     if (insideMcraw)
                         entries = dev.listMcraw(mcrawPath);
-                    else
-                        entries = dev.listDirectory(path);
+                    else {
+                        bool listed = false;
+                        entries = dev.listDirectory(path, &listed);
+                        if (!listed) throw std::runtime_error(dev.lastError());
+                    }
+                    if (!dev.lastError().empty()) throw std::runtime_error(dev.lastError());
                     std::sort(entries.begin(), entries.end(),
                         [col, desc](const DeviceFileEntry& a, const DeviceFileEntry& b) {
                             if (a.isDirectory() != b.isDirectory()) return a.isDirectory();
@@ -2108,7 +2192,7 @@ void App::render() {
                             else cmp = _stricmp(a.name.c_str(), b.name.c_str());
                             return desc ? cmp > 0 : cmp < 0;
                         });
-                }
+                } else throw std::runtime_error("Device is unavailable");
                 UiMessage message;
                 message.listingPanel = targetPanel;
                 message.listingGeneration = generation;
@@ -2119,13 +2203,6 @@ void App::render() {
             });
         } else {
             refreshWindowsPanel(panel);
-            if (panel.navigationTransitionPending) {
-                panel.navigationTransitionPending = false;
-                panel.navigationTransitionReady = true;
-            }
-            panel.needsRefresh = false;
-            panel.refreshInProgress = false;
-            panelsRefreshed = true;
         }
     };
     refreshPanel(m_leftPanel);
@@ -2432,6 +2509,8 @@ void App::render() {
         ImGui::EndPopup();
     }
 
+    renderTransferAttention();
+
     // Update Windows taskbar progress
     {
         bool anyActive = false;
@@ -2493,7 +2572,7 @@ bool App::wantsHighFps() {
     if (m_asyncBusy.load() || m_pollBusy.load() || m_tetheringInProgress.load())
         return true;
 
-    if (m_compareDirty)
+    if (m_compareEnabled && m_compareDirty)
         return true;
     {
         std::lock_guard<std::mutex> lk(m_compareMutex);
@@ -2508,7 +2587,7 @@ bool App::wantsHighFps() {
         std::lock_guard<std::mutex> lk(m_batchMutex);
         for (const auto& batch : m_batchQueue) {
             BatchState state = batch->state.load();
-            if (state == BatchState::Queued || state == BatchState::Running ||
+            if (state == BatchState::Preparing || state == BatchState::Queued || state == BatchState::Running ||
                 state == BatchState::Verifying || state == BatchState::WaitingConflict) {
                 return true;
             }
@@ -2749,7 +2828,7 @@ void App::renderMenuBar() {
                                 int port = w.port;
                                 postAsync("Connecting WiFi...", [this, ip, port]() {
                                     std::string connectAddr = ip + ":" + std::to_string(port);
-                                    std::string result = m_device.runAdbCommand("connect " + connectAddr);
+                                    std::string result = m_device.runAdbCommand("connect " + connectAddr, 4000);
                                     if (result.find("connected") != std::string::npos &&
                                         result.find("failed") == std::string::npos) {
                                         connectDeviceBySerialNow(connectAddr);
@@ -3973,6 +4052,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
             if (specs->SpecsDirty && specs->SpecsCount > 0) {
                 int col = specs->Specs[0].ColumnIndex;
                 bool desc = specs->Specs[0].SortDirection == ImGuiSortDirection_Descending;
+                ++panel.entriesRevision;
                 panel.sortColumn = col;
                 panel.sortDescending = desc;
                 // Re-sort entries
@@ -4029,13 +4109,27 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         }
 
         int count = panel.entryCount();
-        for (int i = 0; i < count; i++) {
-            std::string name = panel.entryName(i);
-            if (!fileNameMatchesFilter(name, filter)) continue;
-            if (!panel.showHidden && !panel.isAndroid) {
-                if (!name.empty() && name[0] == '.') continue;
-                if (i < (int)panel.windowsEntries.size() && panel.windowsEntries[i].isHidden) continue;
+        if (panel.filterRevision != panel.entriesRevision || panel.cachedFilter != filter ||
+            panel.cachedShowHidden != panel.showHidden || panel.cachedEntryCount != count) {
+            panel.filteredIndices.clear();
+            for (int i = 0; i < count; ++i) {
+                const std::string& name = panel.isAndroid ? panel.androidEntries[i].name : panel.windowsEntries[i].name;
+                if (!fileNameMatchesFilter(name, filter)) continue;
+                if (!panel.showHidden && !panel.isAndroid &&
+                    ((!name.empty() && name[0] == '.') || panel.windowsEntries[i].isHidden)) continue;
+                panel.filteredIndices.push_back(i);
             }
+            panel.filterRevision = panel.entriesRevision;
+            panel.cachedFilter = filter;
+            panel.cachedShowHidden = panel.showHidden;
+            panel.cachedEntryCount = count;
+        }
+        ImGuiListClipper clipper;
+        clipper.Begin((int)panel.filteredIndices.size());
+        while (clipper.Step()) for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            int i = panel.filteredIndices[row];
+            if (!panel.validIndex(i)) continue;
+            std::string name = panel.entryName(i);
 
             bool isDir = panel.entryIsDir(i);
             bool isSel = panel.selectedIndices.count(i) > 0;
@@ -4120,18 +4214,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                         std::string mcrawFullPath = panel.currentPath;
                         appendPathSeparator(mcrawFullPath, '\\');
                         mcrawFullPath += name;
-                        FilePanel* targetPanel = &panel;
-                        postAsync("Mounting MCRAW...", [this, mcrawFullPath, targetPanel]() {
-                            std::string mountPath = McrawMountManager::instance().mountMcraw(mcrawFullPath);
-                            if (!mountPath.empty()) {
-                                targetPanel->insideMcraw = true;
-                                targetPanel->mcrawFilePath = mcrawFullPath;
-                                navigateToDirectory(*targetPanel, mountPath);
-                            } else {
-                                m_statusMessage = "Failed to mount MCRAW";
-                                m_statusTime = std::chrono::steady_clock::now();
-                            }
-                        });
+                        requestMcrawMount(panel, mcrawFullPath);
                     } else if (endsWithCI(name, ".mcraw") && panel.isAndroid) {
                         // Android side: navigate into MCRAW as virtual directory (protocol-based)
                         std::string np = panel.currentPath;
@@ -4142,12 +4225,13 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                         // Double-clicked virtual item inside Android MCRAW — pull to temp and open
                         std::string vname = name;
                         std::string mcraw = panel.mcrawFilePath;
-                        postAsync("Extracting " + vname + "...", [this, mcraw, vname]() {
+                        const int slot = panel.deviceSlot;
+                        postAsync("Extracting " + vname + "...", [this, mcraw, vname, slot]() {
                             char tmpDir[MAX_PATH];
                             GetTempPathA(MAX_PATH, tmpDir);
                             std::string tmpPath = std::string(tmpDir) + vname;
                             uint64_t outSize = 0;
-                            if (m_device.pullMcrawItem(mcraw, vname, tmpPath, outSize)) {
+                            if (deviceForSlot(slot).pullMcrawItem(mcraw, vname, tmpPath, outSize)) {
                                 ShellExecuteA(nullptr, "open", tmpPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                             } else {
                                 m_statusMessage = "Failed to extract " + vname;
@@ -4388,6 +4472,160 @@ void App::drawProgressBar(float fraction, const char* overlayText, float height,
     draw->AddText(tp, ImGui::GetColorU32(ImGuiCol_Text), progressText);
 }
 
+void App::updateTransferPresentation() {
+    const auto now = std::chrono::steady_clock::now();
+    const auto inspected = m_overlayVisible ? m_transferDetailsBatch.lock() : nullptr;
+    std::lock_guard<std::mutex> lock(m_batchMutex);
+    for (auto it = m_batchQueue.begin(); it != m_batchQueue.end();) {
+        const auto& batch = *it;
+        const auto state = batch->state.load();
+        const bool needsInteraction = batch->waitingConflict || batch->disconnected || batch->waitingForUserRetry;
+        const bool hasErrors = state == BatchState::Completed &&
+            (batch->errorSkippedFiles > 0 || batch->crcFailCount() > 0);
+        if (m_transferResultRetention.shouldRemove(batch->logId, state, now,
+                batch == inspected, needsInteraction, hasErrors)) {
+            it = m_batchQueue.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void App::renderTransferAttention() {
+    constexpr const char* popupName = "##TransferDecision";
+    std::shared_ptr<TransferBatch> batch;
+    TransferBatch::ConflictRequest request;
+    {
+        std::lock_guard<std::mutex> lock(m_batchMutex);
+        for (const auto& candidate : m_batchQueue) {
+            if (candidate->pendingConflict(request)) {
+                batch = candidate;
+                break;
+            }
+        }
+    }
+    if (batch && (m_transferAttentionBatchId != batch->logId || m_transferAttentionRequest.id != request.id)) {
+        m_transferAttentionBatchId = batch->logId;
+        m_transferAttentionRequest = request;
+        m_transferAttentionApplyAll = false;
+        m_transferAttentionFocus = true;
+        if (g_mainHwnd && GetForegroundWindow() != g_mainHwnd) {
+            FLASHWINFO flash{sizeof(FLASHWINFO), g_mainHwnd, FLASHW_TRAY, 2, 0};
+            FlashWindowEx(&flash);
+        }
+    }
+    if (batch && !ImGui::IsPopupOpen(popupName) &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+        ImGui::OpenPopup(popupName);
+        m_transferAttentionFocus = true;
+    }
+    if (!ImGui::IsPopupOpen(popupName)) return;
+
+    const float s = ui::scale();
+    const auto* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    const float preferredWidth = std::max(620.0f * s, ImGui::GetFontSize() * 27.0f + 48 * s);
+    ImGui::SetNextWindowSize(ImVec2(std::min(preferredWidth, viewport->WorkSize.x * 0.92f), 0));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(viewport->WorkSize.x * 0.92f, viewport->WorkSize.y * 0.90f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24 * s, 22 * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14 * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(12 * s, 12 * s));
+    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.01f, 0.02f, 0.04f, 0.62f));
+    if (ImGui::BeginPopupModal(popupName, nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (!batch) {
+            ImGui::CloseCurrentPopup();
+        } else {
+            const bool light = m_resolvedLightTheme;
+            const ImVec4 attention = light ? ImVec4(0.59f, 0.33f, 0.04f, 1) : ImVec4(1.0f, 0.75f, 0.30f, 1);
+            const ImVec2 top = ImGui::GetCursorScreenPos();
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+            draw->AddRectFilled(top, ImVec2(top.x + 42 * s, top.y + 42 * s),
+                ImGui::GetColorU32(ImVec4(attention.x, attention.y, attention.z, 0.14f)), 10 * s);
+            ui::icon(ui::Icon::Copy, ImVec2(top.x + 10 * s, top.y + 10 * s), 22 * s, ImGui::GetColorU32(attention));
+            ImGui::Dummy(ImVec2(42 * s, 42 * s));
+            ImGui::SameLine();
+            ImGui::BeginGroup();
+            ImFont* headingFont = ui::connectionHeadingFont ? ui::connectionHeadingFont : ui::semiboldFont;
+            if (headingFont) ImGui::PushFont(headingFont);
+            ImGui::TextColored(attention, "Replace this file?");
+            if (headingFont) ImGui::PopFont();
+            ImGui::TextUnformatted("Your transfer needs a decision.");
+            ImGui::EndGroup();
+            ImGui::Separator();
+
+            ImGui::PushTextWrapPos(0);
+            if (ui::semiboldFont) ImGui::PushFont(ui::semiboldFont);
+            ImGui::TextUnformatted(request.fileName.c_str());
+            if (ui::semiboldFont) ImGui::PopFont();
+            ImGui::TextUnformatted("A file with this name already exists at the destination.");
+            ImGui::PopTextWrapPos();
+
+            const std::string source = batch->isLocalCopy || (!batch->isPull && !batch->isCrossDevice)
+                ? "This PC" : deviceDisplayName(batch->srcDeviceSlot);
+            const std::string destination = batch->isLocalCopy || (batch->isPull && !batch->isCrossDevice)
+                ? "This PC" : deviceDisplayName(batch->dstDeviceSlot);
+            const float pathWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x - 28 * s);
+            const float pathHeight = ImGui::CalcTextSize(request.sourcePath.c_str(), nullptr, false, pathWidth).y +
+                ImGui::CalcTextSize(request.destPath.c_str(), nullptr, false, pathWidth).y +
+                ImGui::GetTextLineHeight() * 2 + 64 * s;
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * s, 12 * s));
+            ImGui::BeginChild("##ConflictPaths", ImVec2(0, std::min(pathHeight, 190 * s)), ImGuiChildFlags_Borders);
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextDisabled("FROM  %s", source.c_str());
+            ImGui::TextUnformatted(request.sourcePath.c_str());
+            ImGui::TextDisabled("ALREADY IN  %s", destination.c_str());
+            ImGui::TextUnformatted(request.destPath.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+
+            ImGui::TextWrapped("Replace overwrites the destination file. Skip keeps the existing file.");
+            ImGui::Checkbox("Apply to remaining conflicts", &m_transferAttentionApplyAll);
+            ImGui::Spacing();
+            const float buttonWidth = (ImGui::GetContentRegionAvail().x - 12 * s) * 0.5f;
+            ConflictAction action = ConflictAction::None;
+            if (m_transferAttentionFocus) ImGui::SetKeyboardFocusHere();
+            if (ui::button("Skip file", ui::Icon::Forward, ui::Appearance::Secondary, ImVec2(buttonWidth, ui::controlHeight(42))))
+                action = m_transferAttentionApplyAll ? ConflictAction::SkipAll : ConflictAction::Skip;
+            ImGui::SetItemDefaultFocus();
+            m_transferAttentionFocus = false;
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.97f, 0.69f, 0.24f, 1));
+            if (ui::button("Replace file", ui::Icon::Copy, ui::Appearance::Primary, ImVec2(buttonWidth, ui::controlHeight(42))))
+                action = m_transferAttentionApplyAll ? ConflictAction::OverwriteAll : ConflictAction::Overwrite;
+            ImGui::PopStyleColor();
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) action = ConflictAction::Skip;
+
+            bool submitted = false;
+            if (action != ConflictAction::None) {
+                std::lock_guard<std::mutex> lock(m_batchMutex);
+                submitted = batch->respondToConflict(request.id, action);
+            }
+            if (submitted) {
+                const char* decision = action == ConflictAction::Overwrite ? "Replace" :
+                    action == ConflictAction::OverwriteAll ? "Replace remaining conflicts" :
+                    action == ConflictAction::SkipAll ? "Skip remaining conflicts" : "Skip";
+                batch->logEvent(LogLevel::Info, std::string("Conflict decision: ") + decision + " for " + request.destPath);
+                m_batchCV.notify_all();
+                ImGui::CloseCurrentPopup();
+            }
+            if (ui::button("Cancel transfer", ui::Icon::Close, ui::Appearance::Quiet)) {
+                {
+                    std::lock_guard<std::mutex> lock(m_batchMutex);
+                    batch->requestStop();
+                }
+                batch->logEvent(LogLevel::Info, "Cancelled while waiting for a file conflict decision");
+                m_batchCV.notify_all();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(3);
+}
+
 void App::renderTransferOverlay() {
     std::shared_ptr<TransferBatch> batch;
     int queueSize = 0;
@@ -4411,22 +4649,8 @@ void App::renderTransferOverlay() {
     }
 
     if (auto selected = m_transferDetailsBatch.lock(); selected && m_overlayVisible) batch = selected;
+    else if (m_overlayVisible) m_transferDetailsBatch = batch;
     BatchState st = batch->state.load();
-
-    // Auto-dismiss on success (no CRC failures)
-    if (st == BatchState::Completed && m_prefs.autoDismissTransfer && m_overlayVisible) {
-        if (batch->crcFailCount() == 0) {
-            m_overlayVisible = false;
-            m_overlayWasOpen = false;
-            std::lock_guard<std::mutex> lk(m_batchMutex);
-            while (!m_batchQueue.empty()) {
-                BatchState s = m_batchQueue.front()->state.load();
-                if (s == BatchState::Completed || s == BatchState::Failed || s == BatchState::Stopped)
-                    m_batchQueue.pop_front();
-                else break;
-            }
-        }
-    }
 
     // Smooth fade for overlay
     if (m_overlayVisible)
@@ -4455,6 +4679,14 @@ void App::renderTransferOverlay() {
     bool open = m_overlayVisible;
     ImGui::Begin("Transfer Progress", &open, wf);
     m_overlayVisible = open; // user closed via X
+    if (batch->state == BatchState::Preparing) {
+        ImGui::Text("Scanning source folders: %llu items found", (unsigned long long)batch->discoveredItems.load());
+        if (modernButton("Cancel", ImVec2(90, 0))) batch->requestStop();
+        ImGui::End();
+        ImGui::PopStyleVar();
+        return;
+    }
+
 
     float totalProg   = batch->totalProgress.load();
     float curFileProg = batch->curFileProgress.load();
@@ -4688,43 +4920,7 @@ void App::renderTransferOverlay() {
     bool waitingConflict = batch->waitingConflict.load();
 
     if (waitingConflict) {
-        // File already exists — ask user what to do
-        ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "File already exists:");
-        ImGui::TextColored(ImVec4(0.9f, 0.9f, 1, 1), "  %s", batch->conflictFileName.c_str());
-        ImGui::Spacing();
-
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
-        if (modernButton("Overwrite", ImVec2(100, 0))) {
-            batch->conflictResponse = ConflictAction::Overwrite;
-            batch->logEvent(LogLevel::Info,"Conflict decision: Overwrite for "+batch->conflictFileName);
-            m_batchCV.notify_all();
-        }
-        ImGui::SameLine();
-        if (modernButton("Overwrite All", ImVec2(120, 0))) {
-            batch->conflictResponse = ConflictAction::OverwriteAll;
-            batch->logEvent(LogLevel::Info,"Conflict decision: OverwriteAll for "+batch->conflictFileName);
-            m_batchCV.notify_all();
-        }
-        ImGui::PopStyleColor(2);
-
-        ImGui::SameLine();
-
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.35f, 0.10f, 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.50f, 0.15f, 1));
-        if (modernButton("Skip", ImVec2(100, 0))) {
-            batch->conflictResponse = ConflictAction::Skip;
-            batch->logEvent(LogLevel::Info,"Conflict decision: Skip for "+batch->conflictFileName);
-            m_batchCV.notify_all();
-        }
-        ImGui::SameLine();
-        if (modernButton("Skip All", ImVec2(120, 0))) {
-            batch->conflictResponse = ConflictAction::SkipAll;
-            batch->logEvent(LogLevel::Info,"Conflict decision: SkipAll for "+batch->conflictFileName);
-            m_batchCV.notify_all();
-        }
-        ImGui::PopStyleColor(2);
-
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Waiting for your file replacement decision.");
     } else if (waitingRetry) {
         // Waiting for user decision after retries exhausted
         ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "Reconnection failed. Retry or cancel?");
@@ -4743,7 +4939,7 @@ void App::renderTransferOverlay() {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.18f, 0.18f, 1));
         if (modernButton("Cancel Transfer", ImVec2(140, 0))) {
-            batch->stopRequested = true; batch->logEvent(LogLevel::Info,"Cancel requested");
+            batch->requestStop(); batch->logEvent(LogLevel::Info,"Cancel requested");
             batch->userRetryRequested = false;
             // Stop is handled by progress callback checking stopRequested every chunk
             m_batchCV.notify_all();
@@ -4774,7 +4970,7 @@ void App::renderTransferOverlay() {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.18f, 0.18f, 1));
         if (modernButton("Cancel Transfer", ImVec2(140, 0))) {
-            batch->stopRequested = true; batch->logEvent(LogLevel::Info,"Cancel requested");
+            batch->requestStop(); batch->logEvent(LogLevel::Info,"Cancel requested");
             batch->userRetryRequested = false;
             // Stop is handled by progress callback checking stopRequested every chunk
             m_batchCV.notify_all();
@@ -4813,7 +5009,7 @@ void App::renderTransferOverlay() {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f,0.12f,0.12f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f,0.18f,0.18f,1));
             if (modernButton("Yes", ImVec2(60, 0))) {
-                batch->stopRequested = true; batch->logEvent(LogLevel::Info,"Cancel requested");
+                batch->requestStop(); batch->logEvent(LogLevel::Info,"Cancel requested");
                 batch->pauseRequested = false; batch->logEvent(LogLevel::Info,"Resume requested");
                 // Stop is handled by progress callback checking stopRequested every chunk
                 m_batchCV.notify_all();
@@ -4831,18 +5027,10 @@ void App::renderTransferOverlay() {
             m_overlayVisible = false;
         }
     } else {
-        // Done - show close + maybe clear
         if (modernButton("Close", ImVec2(90, 0))) {
             m_overlayVisible = false;
             m_overlayWasOpen = false;
-            // Clean up completed batches
-            std::lock_guard<std::mutex> lk(m_batchMutex);
-            while (!m_batchQueue.empty()) {
-                BatchState s = m_batchQueue.front()->state.load();
-                if (s == BatchState::Completed || s == BatchState::Failed || s == BatchState::Stopped)
-                    m_batchQueue.pop_front();
-                else break;
-            }
+            m_transferDetailsBatch.reset();
         }
 
         if (st == BatchState::Failed && !batch->errorMessage.empty()) {
@@ -8032,6 +8220,23 @@ void App::renderBackupManagerWindow() {
 
 }
 
+void App::requestMcrawMount(FilePanel& panel, const std::string& path) {
+    FilePanel* target = &panel;
+    const auto generation = panel.listingGeneration;
+    postAsync("Opening MotionCam frames...", [this, target, path, generation] {
+        UiMessage message;
+        message.mountedPanel = target;
+        message.mountedGeneration = generation;
+        message.mountedSource = path;
+        message.mountedPath = McrawMountManager::instance().mountMcraw(path);
+        if (message.mountedPath.empty()) {
+            message.hasStatus = true;
+            message.status = "Could not open MotionCam frames";
+        }
+        postUiMessage(std::move(message));
+    });
+}
+
 void App::openAndroidFile(FilePanel& panel, int index) {
     if (!panel.isAndroid || !panel.validIndex(index)) return;
     if (panel.entryIsDir(index)) return;
@@ -8118,7 +8323,7 @@ void App::renderCopyMoveDialog() {
             m_pendingBatch->isMove = false;
             {
                 std::lock_guard<std::mutex> lk(m_batchMutex);
-                m_pendingBatch->logQueued();
+                prepareTransferManifest(m_pendingBatch);
                 m_batchQueue.push_back(m_pendingBatch);
             }
             m_batchCV.notify_one();
@@ -8137,7 +8342,7 @@ void App::renderCopyMoveDialog() {
             m_pendingBatch->isMove = true;
             {
                 std::lock_guard<std::mutex> lk(m_batchMutex);
-                m_pendingBatch->logQueued();
+                prepareTransferManifest(m_pendingBatch);
                 m_batchQueue.push_back(m_pendingBatch);
             }
             m_batchCV.notify_one();
@@ -8424,7 +8629,7 @@ void App::renderCrossDeviceDialog() {
             m_pendingBatch->useDokanRelay = false;
             {
                 std::lock_guard<std::mutex> lk(m_batchMutex);
-                m_pendingBatch->logQueued();
+                prepareTransferManifest(m_pendingBatch);
                 m_batchQueue.push_back(m_pendingBatch);
             }
             m_batchCV.notify_one();
@@ -8446,7 +8651,7 @@ void App::renderCrossDeviceDialog() {
             m_pendingBatch->useDokanRelay = true;
             {
                 std::lock_guard<std::mutex> lk(m_batchMutex);
-                m_pendingBatch->logQueued();
+                prepareTransferManifest(m_pendingBatch);
                 m_batchQueue.push_back(m_pendingBatch);
             }
             m_batchCV.notify_one();
@@ -8489,7 +8694,7 @@ void App::renderAboutPopup() {
         ImGui::Text("Version: 1.0.22");
         ImGui::Text("Build date: %s", __DATE__);
         ImGui::Spacing();
-        ImGui::Text("Made by: JohnTheFarmer");
+        ImGui::Text("Made by: JohnTheFarm3r");
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -9024,10 +9229,8 @@ void App::renderPreferencesWindow() {
 
     ImGui::Spacing();
 
-    if (ImGui::Checkbox("Auto-dismiss transfer window on success", &m_prefs.autoDismissTransfer))
-        changed = true;
-    ImGui::TextDisabled("  Automatically closes the transfer progress window");
-    ImGui::TextDisabled("  when all files complete successfully.");
+    ImGui::TextWrapped("Finished transfers clear automatically. Transfer details stay open while you review them.");
+    ImGui::TextDisabled("Transfer results remain in the activity log (F12).");
 
     ImGui::Spacing();
     ImGui::TextColored(ImVec4(1,0.85f,0.4f,1), "Transfer Channels");
@@ -10157,7 +10360,6 @@ void App::performClipboardPaste(FilePanel& dstPanel) {
 }
 
 void App::refreshWindowsPanel(FilePanel& panel) {
-    panel.windowsEntries.clear(); panel.selectedIndices.clear();
     std::string mountPoint;
     if (isOwnMountedDevicePath(panel.currentPath, &mountPoint)) {
         std::string blockedPath = panel.currentPath;
@@ -10177,52 +10379,35 @@ void App::refreshWindowsPanel(FilePanel& panel) {
         LOG_WARN("Dokan", "Blocked recursive PC pane access to own mount: " + blockedPath);
         return;
     }
-    std::error_code iterEc;
-    std::filesystem::directory_iterator it(toFsPath(panel.currentPath), std::filesystem::directory_options::skip_permission_denied, iterEc);
-    if (iterEc) {
-        LOG_ERROR("Files","List folder failed: "+panel.currentPath+": "+iterEc.message());
-        m_statusMessage = "Error: " + iterEc.message();
-        m_statusTime = std::chrono::steady_clock::now();
-    } else {
-        for (const auto end = std::filesystem::directory_iterator(); it != end; it.increment(iterEc)) {
-            if (iterEc) { LOG_ERROR("Files","Reading folder failed: "+panel.currentPath+": "+iterEc.message()); break; }
-            const auto& entry = *it;
-            WindowsFileEntry fe;
-            fe.name = pathToUtf8(entry.path().filename());
-            std::error_code ec;
-            fe.isDirectory = entry.is_directory(ec);
-            if (ec) fe.isDirectory = false;
-            DWORD attrs = GetFileAttributesW(entry.path().wstring().c_str());
-            fe.isHidden = (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_HIDDEN);
-            if (!fe.isDirectory) {
-                ec.clear();
-                fe.size = entry.file_size(ec);
-                if (ec) fe.size = 0;
-            }
-            try {
-                auto ft = entry.last_write_time();
-                auto sc = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                    ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
-                auto t = std::chrono::system_clock::to_time_t(sc);
-                struct tm tm; localtime_s(&tm, &t);
-                char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm);
-                fe.dateModified = buf;
-            } catch (...) { fe.dateModified = ""; }
-            panel.windowsEntries.push_back(std::move(fe));
-        }
-    }
-    int col = panel.sortColumn;
-    bool desc = panel.sortDescending;
-    std::sort(panel.windowsEntries.begin(), panel.windowsEntries.end(),
-        [col, desc](const WindowsFileEntry& a, const WindowsFileEntry& b) {
+    if (panel.refreshInProgress) return;
+    panel.refreshInProgress = true;
+    panel.needsRefresh = false;
+    const auto generation = ++panel.listingGeneration;
+    const int col = panel.sortColumn;
+    const bool desc = panel.sortDescending;
+    const int slot = panel.deviceSlot;
+    const std::string path = panel.currentPath;
+    FilePanel* target = &panel;
+    postListing(target, [this, target, generation, slot, path, col, desc] {
+        auto started = std::chrono::steady_clock::now();
+        auto entries = listWindowsDirectory(toFsPath(path), [this] { return m_shutdownPoll.load(); });
+        std::sort(entries.begin(), entries.end(), [col, desc](const WindowsFileEntry& a, const WindowsFileEntry& b) {
             if (a.isDirectory != b.isDirectory) return a.isDirectory > b.isDirectory;
-            int cmp;
-            if (col == 1) cmp = (a.size < b.size) ? -1 : (a.size > b.size) ? 1 : 0;
-            else if (col == 2) cmp = a.dateModified.compare(b.dateModified);
-            else cmp = _stricmp(a.name.c_str(), b.name.c_str());
+            int cmp = col == 1 ? (a.size < b.size ? -1 : a.size > b.size ? 1 : 0) :
+                col == 2 ? a.dateModified.compare(b.dateModified) : _stricmp(a.name.c_str(), b.name.c_str());
             return desc ? cmp > 0 : cmp < 0;
         });
-    strcpy_s(panel.pathInput, panel.currentPath.c_str());
+        LOG_DEBUG("Perf", "Listed " + std::to_string(entries.size()) + " PC entries in " +
+            std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()) + " ms");
+        UiMessage message;
+        message.listingPanel = target;
+        message.listingGeneration = generation;
+        message.listingSlot = slot;
+        message.listingPath = path;
+        message.listingWindows = true;
+        message.listingWindowsEntries = std::move(entries);
+        postUiMessage(std::move(message));
+    });
 }
 
 void App::refreshAndroidPanel(FilePanel& panel) {
@@ -10294,6 +10479,11 @@ void App::navigateToDirectory(FilePanel& panel, const std::string& path) {
         panel.navHistoryPos = (int)panel.navHistory.size() - 1;
         if (panel.navHistory.size() > 50) { panel.navHistory.erase(panel.navHistory.begin()); panel.navHistoryPos--; }
     }
+    ++panel.listingGeneration;
+    ++panel.entriesRevision;
+    panel.refreshInProgress = false;
+    panel.windowsEntries.clear();
+    panel.androidEntries.clear();
     panel.currentPath = path; panel.selectedIndices.clear(); panel.focusedIndex = -1;
     panel.searchFilter[0] = '\0'; panel.needsRefresh = true;
 
@@ -10516,7 +10706,7 @@ void App::devicePollLoop() {
         std::lock_guard<std::mutex> lk(m_batchMutex);
         for (auto& b : m_batchQueue) {
             auto s = b->state.load();
-            if (s == BatchState::Running || s == BatchState::Paused || s == BatchState::Queued || s == BatchState::Verifying) return true;
+            if (s == BatchState::Preparing || s == BatchState::Running || s == BatchState::Paused || s == BatchState::Queued || s == BatchState::Verifying) return true;
         }
         return false;
     };
@@ -10631,28 +10821,14 @@ void App::devicePollLoop() {
                         }
                     }
                 }
-                // Second: find USB device with same model name, but ONLY if there's
-                // exactly one other device (otherwise we can't tell which USB belongs
-                // to this WiFi device and would grab a different device's USB)
                 if (usbSerial.empty()) {
-                    int onlineUsbCount = 0;
-                    for (auto& d : m_devices)
-                        if (d.state == "device" && !isWifiSerial(d.serial)) onlineUsbCount++;
-
-                    if (onlineUsbCount == 1) {
-                        std::string wifiModel;
-                        for (auto& d : m_devices)
-                            if (d.serial == curSerial) { wifiModel = d.model; break; }
-                        if (!wifiModel.empty()) {
-                            for (auto& d : m_devices) {
-                                if (d.state == "device" && !isWifiSerial(d.serial) && d.model == wifiModel) {
-                                    usbSerial = d.serial;
-                                    break;
-                                }
-                            }
+                    const std::string identity = deviceIdentity(curSerial);
+                    for (const auto& device : m_devices) {
+                        if (device.state == "device" && !isWifiSerial(device.serial) &&
+                            deviceIdentity(device.serial) == identity) {
+                            usbSerial = device.serial;
+                            break;
                         }
-                    } else if (onlineUsbCount > 1) {
-                        LOG_INFO("Poll", "Multiple USB devices online, skipping model-based dual channel pairing to avoid grabbing wrong device");
                     }
                 }
             }
@@ -10933,22 +11109,10 @@ void App::devicePollLoop() {
                 // If offline or not in list at all, try to reconnect
                 // Quick TCP probe first (1s timeout) to avoid 21s adb connect timeout
                 if (!isOnline) {
-                    SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                    if (probe != INVALID_SOCKET) {
-                        unsigned long nonBlock = 1;
-                        ioctlsocket(probe, FIONBIO, &nonBlock);
-                        sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(w.port);
-                        inet_pton(AF_INET, w.wifiIp.c_str(), &addr.sin_addr);
-                        connect(probe, (sockaddr*)&addr, sizeof(addr));
-                        fd_set wset; FD_ZERO(&wset); FD_SET(probe, &wset);
-                        timeval tv = {1, 0}; // 1 second timeout
-                        int sel = select((int)probe + 1, nullptr, &wset, nullptr, &tv);
-                        closesocket(probe);
-                        if (sel <= 0) continue; // not reachable, skip adb connect
-                    }
+                    if (!probeTcpEndpoint(w.wifiIp, w.port)) continue;
 
                     LOG_DEBUG("Poll", "WiFi device reachable, trying adb connect: " + connectAddr);
-                    std::string result = m_device.runAdbCommand("connect " + connectAddr);
+                    std::string result = m_device.runAdbCommand("connect " + connectAddr, 4000);
                     if (result.find("connected") != std::string::npos &&
                         result.find("failed") == std::string::npos) {
                         LOG_INFO("Poll", "WiFi device reconnected: " + connectAddr);
@@ -11085,24 +11249,11 @@ void App::devicePollLoop() {
                                 std::string connectAddr = w.wifiIp + ":" + std::to_string(w.port);
 
                                 // Quick TCP probe (1s timeout)
-                                bool reachable = false;
-                                SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                                if (probe != INVALID_SOCKET) {
-                                    unsigned long nonBlock = 1;
-                                    ioctlsocket(probe, FIONBIO, &nonBlock);
-                                    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(w.port);
-                                    inet_pton(AF_INET, w.wifiIp.c_str(), &addr.sin_addr);
-                                    connect(probe, (sockaddr*)&addr, sizeof(addr));
-                                    fd_set wset; FD_ZERO(&wset); FD_SET(probe, &wset);
-                                    timeval tv = {1, 0};
-                                    int sel = select((int)probe + 1, nullptr, &wset, nullptr, &tv);
-                                    closesocket(probe);
-                                    reachable = (sel > 0);
-                                }
+                                bool reachable = probeTcpEndpoint(w.wifiIp, w.port);
 
                                 if (reachable) {
                                     LOG_INFO("Poll", "WiFi probe: " + connectAddr + " reachable, connecting...");
-                                    std::string result = m_device.runAdbCommand("connect " + connectAddr);
+                                    std::string result = m_device.runAdbCommand("connect " + connectAddr, 4000);
                                     if (result.find("connected") != std::string::npos &&
                                         result.find("failed") == std::string::npos) {
                                         LOG_INFO("Poll", "WiFi auto-connect on launch: " + connectAddr);
@@ -11356,50 +11507,6 @@ void App::onDeviceChanged() {
 }
 
 // Recursively add directory contents for pull (Android → Windows)
-static void addPullDirRecursive(DeviceClient& dev, const std::string& srcDir, const std::string& dstDir,
-                                 std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
-    auto entries = dev.listDirectory(srcDir);
-    for (auto& e : entries) {
-        BatchFileItem sub;
-        sub.displayName = e.name;
-        sub.isDirectory = e.isDirectory();
-        sub.fileSize = e.size;
-        sub.sourcePath = srcDir + "/" + e.name;
-        sub.destPath = dstDir + "\\" + e.name;
-        totalBytes += sub.fileSize;
-        items.push_back(sub);
-        if (sub.isDirectory)
-            addPullDirRecursive(dev, sub.sourcePath, sub.destPath, items, totalBytes);
-    }
-}
-
-// Recursively add directory contents for push (Windows → Android)
-static void addPushDirRecursive(const std::string& srcDir, const std::string& dstDir,
-                                 std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
-    std::error_code iterEc;
-    std::filesystem::directory_iterator it(toFsPath(srcDir), std::filesystem::directory_options::skip_permission_denied, iterEc);
-    if (iterEc) return;
-    for (const auto end = std::filesystem::directory_iterator(); it != end; it.increment(iterEc)) {
-        if (iterEc) { iterEc.clear(); continue; }
-        auto& entry = *it;
-        BatchFileItem sub;
-        sub.displayName = pathToUtf8(entry.path().filename());
-        std::error_code ec;
-        sub.isDirectory = entry.is_directory(ec);
-        if (ec) sub.isDirectory = false;
-        sub.sourcePath = pathToUtf8(entry.path());
-        sub.destPath = dstDir + "/" + sub.displayName;
-        if (!sub.isDirectory) {
-            sub.fileSize = (uint64_t)entry.file_size(ec);
-            if (ec) sub.fileSize = 0;
-        }
-        totalBytes += sub.fileSize;
-        items.push_back(sub);
-        if (sub.isDirectory)
-            addPushDirRecursive(sub.sourcePath, sub.destPath, items, totalBytes);
-    }
-}
-
 static void buildBatchItems(FilePanel& srcPanel, FilePanel& dstPanel, bool isPull,
                             std::vector<BatchFileItem>& items, uint64_t& totalBytes,
                             DeviceClient* dev = nullptr) {
@@ -11453,34 +11560,11 @@ static void buildBatchItems(FilePanel& srcPanel, FilePanel& dstPanel, bool isPul
         totalBytes += item.fileSize;
         items.push_back(item);
 
-        // Recursively add directory contents
-        if (item.isDirectory && dev) {
-            if (isPull)
-                addPullDirRecursive(*dev, item.sourcePath, item.destPath, items, totalBytes);
-            else
-                addPushDirRecursive(item.sourcePath, item.destPath, items, totalBytes);
-        }
+
     }
 }
 
 // Build batch items for cross-device Android-to-Android transfer
-static void addCrossDeviceDirRecursive(DeviceClient& srcDev, const std::string& srcDir, const std::string& dstDir,
-                                        std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
-    auto entries = srcDev.listDirectory(srcDir);
-    for (auto& e : entries) {
-        BatchFileItem sub;
-        sub.displayName = e.name;
-        sub.isDirectory = e.isDirectory();
-        sub.fileSize = e.size;
-        sub.sourcePath = srcDir + "/" + e.name;
-        sub.destPath = dstDir + "/" + e.name;
-        totalBytes += sub.fileSize;
-        items.push_back(sub);
-        if (sub.isDirectory)
-            addCrossDeviceDirRecursive(srcDev, sub.sourcePath, sub.destPath, items, totalBytes);
-    }
-}
-
 static void buildCrossDeviceBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
                                         std::vector<BatchFileItem>& items, uint64_t& totalBytes,
                                         DeviceClient* srcDev = nullptr) {
@@ -11503,38 +11587,10 @@ static void buildCrossDeviceBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
         totalBytes += item.fileSize;
         items.push_back(item);
 
-        if (item.isDirectory && srcDev)
-            addCrossDeviceDirRecursive(*srcDev, item.sourcePath, item.destPath, items, totalBytes);
     }
 }
 
 // Recursively add local directory contents
-static void addLocalDirRecursive(const std::string& srcDir, const std::string& dstDir,
-                                  std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
-    std::error_code iterEc;
-    std::filesystem::directory_iterator it(toFsPath(srcDir), std::filesystem::directory_options::skip_permission_denied, iterEc);
-    if (iterEc) return;
-    for (const auto end = std::filesystem::directory_iterator(); it != end; it.increment(iterEc)) {
-        if (iterEc) { iterEc.clear(); continue; }
-        auto& entry = *it;
-        BatchFileItem sub;
-        sub.displayName = pathToUtf8(entry.path().filename());
-        std::error_code ec;
-        sub.isDirectory = entry.is_directory(ec);
-        if (ec) sub.isDirectory = false;
-        sub.sourcePath = pathToUtf8(entry.path());
-        sub.destPath = dstDir + "\\" + sub.displayName;
-        if (!sub.isDirectory) {
-            sub.fileSize = (uint64_t)entry.file_size(ec);
-            if (ec) sub.fileSize = 0;
-        }
-        totalBytes += sub.fileSize;
-        items.push_back(sub);
-        if (sub.isDirectory)
-            addLocalDirRecursive(sub.sourcePath, sub.destPath, items, totalBytes);
-    }
-}
-
 static void buildLocalBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
                                   std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
     for (int idx : srcPanel.selectedIndices) {
@@ -11558,9 +11614,85 @@ static void buildLocalBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
         totalBytes += item.fileSize;
         items.push_back(item);
 
-        if (item.isDirectory)
-            addLocalDirRecursive(item.sourcePath, item.destPath, items, totalBytes);
     }
+}
+
+void App::prepareTransferManifest(const std::shared_ptr<TransferBatch>& batch) {
+    batch->state = BatchState::Preparing;
+    auto roots = batch->files;
+    m_manifestWork.post(0, [this, batch, roots = std::move(roots)]() mutable {
+        UiMessage result;
+        result.preparedBatch = batch;
+        auto cancelled = [this, &batch] { return m_shutdownPoll.load() || batch->stopRequested.load(); };
+        try {
+            DeviceClient source;
+            auto sourceCancellation = batch->cancellation.track(source);
+            const bool remoteSource = !batch->isLocalCopy && (batch->isPull || batch->isCrossDevice);
+            if (remoteSource && !cancelled() && !source.connectParallelFrom(deviceForSlot(batch->srcDeviceSlot)))
+                throw std::runtime_error("Source device is unavailable");
+            if (cancelled()) source.interruptBlocking();
+            std::vector<BatchFileItem> pending(roots.rbegin(), roots.rend());
+            std::unordered_set<std::wstring> visitedDirectories;
+            while (!pending.empty() && !cancelled()) {
+                auto item = std::move(pending.back());
+                pending.pop_back();
+                if (!item.isDirectory) {
+                    if (!remoteSource && !item.isMcrawVirtual)
+                        item.fileSize = std::filesystem::file_size(toFsPath(item.sourcePath));
+                    if (item.fileSize > UINT64_MAX - result.preparedBytes)
+                        throw std::runtime_error("Selected files exceed the supported total size");
+                    result.preparedBytes += item.fileSize;
+                    result.preparedFiles.push_back(std::move(item));
+                    batch->discoveredItems = result.preparedFiles.size();
+                    continue;
+                }
+                item.fileSize = 0;
+                result.preparedFiles.push_back(item);
+                batch->discoveredItems = result.preparedFiles.size();
+                std::vector<BatchFileItem> children;
+                if (remoteSource) {
+                    bool listed = false;
+                    auto entries = source.listDirectory(item.sourcePath, &listed);
+                    if (!listed) throw std::runtime_error(item.sourcePath + ": " + source.lastError());
+                    for (const auto& entry : entries) {
+                        if (cancelled()) break;
+                        if (entry.name == "." || entry.name == ".." || entry.name.find('/') != std::string::npos ||
+                            entry.name.find('\\') != std::string::npos)
+                            throw std::runtime_error("Invalid source entry: " + entry.name);
+                        BatchFileItem child;
+                        child.displayName = entry.name;
+                        child.sourcePath = item.sourcePath + "/" + entry.name;
+                        child.destPath = item.destPath + (batch->isCrossDevice ? "/" : "\\") + entry.name;
+                        child.fileSize = entry.size;
+                        child.isDirectory = entry.isDirectory();
+                        children.push_back(std::move(child));
+                    }
+                } else {
+                    auto canonical = std::filesystem::canonical(toFsPath(item.sourcePath)).wstring();
+                    std::transform(canonical.begin(), canonical.end(), canonical.begin(), [](wchar_t c) { return towlower(c); });
+                    if (!visitedDirectories.insert(canonical).second)
+                        throw std::runtime_error("Repeated directory or link cycle: " + item.sourcePath);
+                    for (const auto& entry : listWindowsDirectory(toFsPath(item.sourcePath), cancelled)) {
+                        BatchFileItem child;
+                        child.displayName = entry.name;
+                        child.sourcePath = item.sourcePath + "\\" + entry.name;
+                        child.destPath = item.destPath + (batch->isLocalCopy ? "\\" : "/") + entry.name;
+                        child.fileSize = entry.size;
+                        child.isDirectory = entry.isDirectory;
+                        children.push_back(std::move(child));
+                    }
+                }
+                for (auto it = children.rbegin(); it != children.rend(); ++it) pending.push_back(std::move(*it));
+            }
+            if (!cancelled()) batch->logEvent(LogLevel::Info, "Source scan finished, " +
+                std::to_string(result.preparedFiles.size()) + " items");
+        } catch (const std::exception& error) {
+            result.preparationError = error.what();
+        } catch (...) {
+            result.preparationError = "Unexpected source scan failure";
+        }
+        postUiMessage(std::move(result));
+    });
 }
 
 void App::startWorkspaceTransfer(bool move) {
@@ -11675,7 +11807,7 @@ void App::queuePanelTransfer(FilePanel& src, FilePanel& dst, bool move) {
     const FilePanel& transferDevicePanel = src.isAndroid ? src : dst;
     auto transferPipes = m_prefs.pipePreferencesFor(deviceSession(transferDevicePanel.deviceSlot).serial);
     batch->useParallelChannels = !localCopy &&
-        (transferPipes.usbPipeCount > 1 || transferPipes.wifiPipeCount > 1);
+        (transferPipes.usbPipeCount + transferPipes.wifiPipeCount > 1);
 
     uint64_t total = 0;
     if (localCopy)
@@ -11693,7 +11825,7 @@ void App::queuePanelTransfer(FilePanel& src, FilePanel& dst, bool move) {
         m_showCrossDeviceDialog = true;
     } else {
         std::lock_guard<std::mutex> lk(m_batchMutex);
-        batch->logQueued();
+        prepareTransferManifest(batch);
         m_batchQueue.push_back(batch);
         m_batchCV.notify_one();
         m_overlayWasOpen = false;
@@ -11726,7 +11858,7 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
     if (target->isAndroid) {
         batch->dstDeviceSlot = target->deviceSlot;
         auto transferPipes = m_prefs.pipePreferencesFor(deviceSession(target->deviceSlot).serial);
-        batch->useParallelChannels = transferPipes.usbPipeCount > 1 || transferPipes.wifiPipeCount > 1;
+        batch->useParallelChannels = transferPipes.usbPipeCount + transferPipes.wifiPipeCount > 1;
     }
 
     for (auto& srcPath : paths) {
@@ -11759,16 +11891,7 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
             if (ec) item.fileSize = 0;
         }
         total += item.fileSize;
-        bool isDir = item.isDirectory;
-        std::string dirSource = item.sourcePath;
-        std::string dirDest = item.destPath;
         batch->files.push_back(std::move(item));
-        if (isDir) {
-            if (target->isAndroid)
-                addPushDirRecursive(dirSource, dirDest, batch->files, total);
-            else
-                addLocalDirRecursive(dirSource, dirDest, batch->files, total);
-        }
     }
 
     batch->totalBytes = total;
@@ -11794,7 +11917,7 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
         if (sameDrive) {
             batch->isMove = true;
             std::lock_guard<std::mutex> lk(m_batchMutex);
-            batch->logQueued();
+            prepareTransferManifest(batch);
             m_batchQueue.push_back(batch);
             m_batchCV.notify_one();
             m_overlayWasOpen = false;
@@ -11804,7 +11927,7 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
         }
     } else {
         std::lock_guard<std::mutex> lk(m_batchMutex);
-        batch->logQueued();
+        prepareTransferManifest(batch);
         m_batchQueue.push_back(batch);
         m_batchCV.notify_one();
         m_overlayWasOpen = false;
@@ -11841,18 +11964,21 @@ void App::processBatchQueue() {
             for (auto& b : m_batchQueue) {
                 if (b->state.load() == BatchState::Queued) { batch = b; break; }
             }
-            while (m_batchQueue.size() > 10) {
-                BatchState s = m_batchQueue.front()->state.load();
-                if (s == BatchState::Completed || s == BatchState::Failed || s == BatchState::Stopped)
-                    m_batchQueue.pop_front();
-                else break;
-            }
         }
         if (!batch) continue;
         struct OutcomeLog {
             std::shared_ptr<TransferBatch> batch;
             ~OutcomeLog() {
                 auto state=batch->state.load();
+                if (batch->stopRequested && state != BatchState::Completed) {
+                    state = BatchState::Stopped;
+                    batch->state = state;
+                }
+                if (state == BatchState::Completed || state == BatchState::Failed || state == BatchState::Stopped) {
+                    batch->disconnected = false;
+                    batch->waitingForUserRetry = false;
+                    batch->finishConflict();
+                }
                 bool errors=state==BatchState::Failed || batch->errorSkippedFiles>0 || batch->crcFailCount()>0;
                 std::string outcome=state==BatchState::Completed?(errors?"Completed with errors":"Completed"):
                     state==BatchState::Stopped?"Cancelled":state==BatchState::Failed?"Failed":"Interrupted";
@@ -11892,6 +12018,15 @@ void App::processBatchQueue() {
         // pulls read from the Android source slot, pushes write to the Android destination slot.
         int batchDeviceSlot = batch->isPull ? batch->srcDeviceSlot : batch->dstDeviceSlot;
         DeviceClient& batchDev = deviceSession(batchDeviceSlot).client;
+        std::unique_ptr<TransferCancellation<DeviceClient>::Registration> primaryCancellation, peerCancellation;
+        if (!batch->isLocalCopy) {
+            primaryCancellation = batch->cancellation.track(batchDev);
+            if (batch->isCrossDevice) {
+                const int peerSlot = batchDeviceSlot == batch->srcDeviceSlot ? batch->dstDeviceSlot : batch->srcDeviceSlot;
+                if (peerSlot != batchDeviceSlot) peerCancellation = batch->cancellation.track(deviceForSlot(peerSlot));
+            }
+        }
+        if (batch->stopRequested) { batch->state = BatchState::Stopped; continue; }
 
         if (!batch->isLocalCopy && !batch->isCrossDevice && !batchDev.isServerRunning()) {
             batch->state = BatchState::Failed;
@@ -12046,6 +12181,7 @@ void App::processBatchQueue() {
             std::string name;
             std::string reconnectIp;
             bool preferUsb = false;
+            std::unique_ptr<TransferCancellation<DeviceClient>::Registration> cancellation;
         };
         std::vector<RuntimeChannel> runtimeChannels;
         std::string batchWifiIp;
@@ -12118,6 +12254,7 @@ void App::processBatchQueue() {
             int remoteHelperPort = batchDev.serverPort();
 
             auto addUsbChannel = [&]() -> bool {
+                if (batch->stopRequested) return false;
                 if (batchUsbSerial.empty()) return false;
                 for (int attempt = 0; attempt < 32; attempt++) {
                     auto ch = std::make_unique<DeviceClient>();
@@ -12144,6 +12281,7 @@ void App::processBatchQueue() {
                     RuntimeChannel rc;
                     rc.dev = ch.get();
                     rc.owned = std::move(ch);
+                    rc.cancellation = batch->cancellation.track(*rc.dev);
                     rc.name = "USB (ADB)";
                     rc.reconnectIp = batchWifiIp;
                     rc.preferUsb = true;
@@ -12155,6 +12293,7 @@ void App::processBatchQueue() {
             };
 
             auto addWifiChannel = [&]() -> bool {
+                if (batch->stopRequested) return false;
                 if (batchWifiIp.empty()) return false;
                 auto ch = std::make_unique<DeviceClient>();
                 ch->setAdbPath(batchDev.getAdbPath());
@@ -12165,6 +12304,7 @@ void App::processBatchQueue() {
                 RuntimeChannel rc;
                 rc.dev = ch.get();
                 rc.owned = std::move(ch);
+                rc.cancellation = batch->cancellation.track(*rc.dev);
                 rc.name = "WiFi (Direct)";
                 rc.reconnectIp = batchWifiIp;
                 rc.preferUsb = false;
@@ -12196,6 +12336,9 @@ void App::processBatchQueue() {
                 "Starting parallel dual-channel transfer (" +
                 std::to_string(batch->totalFiles()) + " files)");
 
+            std::vector<std::unique_ptr<TransferCancellation<DeviceClient>::Registration>> nicCancellation;
+            if (useMultiNic) for (auto* client : multiNicDevPtrs)
+                nicCancellation.push_back(batch->cancellation.track(*client));
             auto parallelStart = std::chrono::steady_clock::now();
 
             // Setup per-channel names
@@ -12282,10 +12425,7 @@ void App::processBatchQueue() {
                 if (destExists) {
                     ConflictAction action = batch->conflictAllDecision;
                     if (action == ConflictAction::None) {
-                        batch->conflictFileName = item.displayName;
-                        batch->waitingConflict = true;
-                        batch->conflictResponse = ConflictAction::None;
-                        batch->state = BatchState::WaitingConflict;
+                        batch->beginConflict(item);
                         {
                             std::unique_lock<std::mutex> lk(m_batchMutex);
                             m_batchCV.wait(lk, [&]() {
@@ -12293,9 +12433,7 @@ void App::processBatchQueue() {
                                        batch->conflictResponse.load() != ConflictAction::None;
                             });
                         }
-                        batch->waitingConflict = false;
-                        action = batch->conflictResponse.load();
-                        batch->conflictResponse = ConflictAction::None;
+                        action = batch->finishConflict();
                         batch->state = BatchState::Running;
 
                         if (action == ConflictAction::OverwriteAll) {
@@ -13256,6 +13394,7 @@ void App::processBatchQueue() {
                     }
                 }
             }
+            nicCancellation.clear();
             // Clean up multi-NIC channels after transfer completes
             if (useMultiNic) {
                 for (auto& ch : m_nicChannels) ch->disconnectTcp();
@@ -13358,6 +13497,7 @@ void App::processBatchQueue() {
             int remoteHelperPort = baseDev.serverPort();
 
             auto addUsbChannel = [&]() -> bool {
+                if (batch->stopRequested) return false;
                 if (usbSerial.empty()) return false;
                 for (int attempt = 0; attempt < 32; attempt++) {
                     auto ch = std::make_unique<DeviceClient>();
@@ -13384,6 +13524,7 @@ void App::processBatchQueue() {
                     RuntimeChannel rc;
                     rc.dev = ch.get();
                     rc.owned = std::move(ch);
+                    rc.cancellation = batch->cancellation.track(*rc.dev);
                     rc.name = "USB (ADB)";
                     rc.reconnectIp = wifiIp;
                     rc.preferUsb = true;
@@ -13395,6 +13536,7 @@ void App::processBatchQueue() {
             };
 
             auto addWifiChannel = [&]() -> bool {
+                if (batch->stopRequested) return false;
                 if (wifiIp.empty()) return false;
                 auto ch = std::make_unique<DeviceClient>();
                 ch->setAdbPath(baseDev.getAdbPath());
@@ -13405,6 +13547,7 @@ void App::processBatchQueue() {
                 RuntimeChannel rc;
                 rc.dev = ch.get();
                 rc.owned = std::move(ch);
+                rc.cancellation = batch->cancellation.track(*rc.dev);
                 rc.name = "WiFi (Direct)";
                 rc.reconnectIp = wifiIp;
                 rc.preferUsb = false;
@@ -13499,10 +13642,7 @@ void App::processBatchQueue() {
                 if (destExists) {
                     ConflictAction action = batch->conflictAllDecision;
                     if (action == ConflictAction::None) {
-                        batch->conflictFileName = item.displayName;
-                        batch->waitingConflict = true;
-                        batch->conflictResponse = ConflictAction::None;
-                        batch->state = BatchState::WaitingConflict;
+                        batch->beginConflict(item);
                         {
                             std::unique_lock<std::mutex> lk(m_batchMutex);
                             m_batchCV.wait(lk, [&]() {
@@ -13510,9 +13650,7 @@ void App::processBatchQueue() {
                                     batch->conflictResponse.load() != ConflictAction::None;
                             });
                         }
-                        batch->waitingConflict = false;
-                        action = batch->conflictResponse.load();
-                        batch->conflictResponse = ConflictAction::None;
+                        action = batch->finishConflict();
                         batch->state = BatchState::Running;
                         if (action == ConflictAction::OverwriteAll) {
                             batch->conflictAllDecision = ConflictAction::OverwriteAll;
@@ -14052,7 +14190,9 @@ void App::processBatchQueue() {
             }
         }
 
+        bool currentDestinationStarted = false;
         for (int fi = 0; fi < batch->totalFiles() && !m_shutdownTransfer; fi++) {
+            currentDestinationStarted = false;
             if (batch->stopRequested.load()) { batch->state = BatchState::Stopped; break; }
 
             // Pause — track paused duration for accurate avg speed
@@ -14136,10 +14276,7 @@ void App::processBatchQueue() {
 
                     if (action == ConflictAction::None) {
                         // No sticky decision — ask the user
-                        batch->conflictFileName = item.displayName;
-                        batch->waitingConflict = true;
-                        batch->conflictResponse = ConflictAction::None;
-                        batch->state = BatchState::WaitingConflict;
+                        batch->beginConflict(item);
 
                         // Wait for UI thread to set conflictResponse
                         {
@@ -14149,9 +14286,7 @@ void App::processBatchQueue() {
                                        batch->conflictResponse.load() != ConflictAction::None;
                             });
                         }
-                        batch->waitingConflict = false;
-                        action = batch->conflictResponse.load();
-                        batch->conflictResponse = ConflictAction::None;
+                        action = batch->finishConflict();
                         batch->state = BatchState::Running;
 
                         // Store sticky "All" decisions
@@ -14234,6 +14369,8 @@ void App::processBatchQueue() {
 
                 return true;
             };
+
+            currentDestinationStarted = !item.isDirectory;
 
             // --- Local copy/move (Windows-to-Windows) ---
             if (batch->isLocalCopy) {
@@ -14773,7 +14910,7 @@ void App::processBatchQueue() {
         if (batch->state.load() == BatchState::Stopped || batch->state.load() == BatchState::Failed) {
             // Delete the partially-transferred file (the one that was in progress when stopped)
             int curIdx = batch->currentFileIndex.load();
-            if (curIdx >= 0 && curIdx < batch->totalFiles()) {
+            if (currentDestinationStarted && curIdx >= 0 && curIdx < batch->totalFiles()) {
                 auto& item = batch->files[curIdx];
                 if (!item.isDirectory && batch->isPull && !batch->isLocalCopy) {
                     // Pull: partial file is on Windows
@@ -14851,30 +14988,27 @@ void App::processBatchQueue() {
 }
 
 std::string App::queryDeviceDisplayName(const std::string& serial) {
-    // Try properties in priority order: marketing name, then brand + model fallback
-    const char* props[] = {
-        "ro.product.marketname",
-        "ro.product.vendor.marketname",
-        "ro.config.marketing_name",
-    };
-    for (auto prop : props) {
-        std::string val = sanitizeDeviceDisplayValue(
-            m_device.runAdbCommand("-s " + serial + " shell getprop " + prop));
-        if (!val.empty()) return val;
+    DeviceClient query;
+    query.setAdbPath(m_device.getAdbPath());
+    auto result = query.runAdbCommandResult("-s " + serial +
+        " shell getprop", 2500, [this] { return m_shutdownPoll.load(); });
+    if (!result.succeeded()) return {};
+    std::unordered_map<std::string, std::string> properties;
+    std::istringstream lines(result.standardOutput);
+    std::string line;
+    while (std::getline(lines, line)) {
+        const auto split = line.find("]: [");
+        const auto end = line.rfind(']');
+        if (line.empty() || line.front() != '[' || split == std::string::npos || end <= split + 3) continue;
+        properties[line.substr(1, split - 1)] = sanitizeDeviceDisplayValue(line.substr(split + 4, end - split - 4));
     }
-    // Fallback: "Brand Model" e.g. "Samsung SM-S911B"
-    std::string brand = sanitizeDeviceDisplayValue(
-        m_device.runAdbCommand("-s " + serial + " shell getprop ro.product.brand"));
-    std::string model = sanitizeDeviceDisplayValue(
-        m_device.runAdbCommand("-s " + serial + " shell getprop ro.product.model"));
-    if (!brand.empty()) {
-        // Capitalize first letter
-        if (!brand.empty()) brand[0] = (char)toupper((unsigned char)brand[0]);
-        if (!model.empty()) return brand + " " + model;
-        return brand;
-    }
-    if (!model.empty()) return model;
-    return "";
+    for (const char* key : {"ro.product.marketname", "ro.product.vendor.marketname", "ro.config.marketing_name"})
+        if (!properties[key].empty()) return properties[key];
+    std::string brand = properties["ro.product.brand"];
+    const std::string model = properties["ro.product.model"];
+    if (brand.empty()) return model;
+    brand[0] = (char)toupper((unsigned char)brand[0]);
+    return model.empty() ? brand : brand + " " + model;
 }
 
 std::string App::formatSize(uint64_t bytes) {

@@ -1,5 +1,6 @@
 #include "app.h"
 #include "ui_widgets.h"
+#include "ui_transfer.h"
 #include "device_dokan.h"
 #include "mcraw_projfs.h"
 #include <algorithm>
@@ -14,11 +15,26 @@ bool finished(BatchState state) {
     return state == BatchState::Completed || state == BatchState::Failed || state == BatchState::Stopped;
 }
 
+template<class Batches>
+std::shared_ptr<TransferBatch> visibleTransfer(const Batches& batches) {
+    for (const auto& batch : batches)
+        if (!finished(batch->state.load()) && batch->waitingConflict && !batch->stopRequested) return batch;
+    for (const auto& batch : batches) {
+        const auto state = batch->state.load();
+        if (state == BatchState::Running || state == BatchState::Paused ||
+            state == BatchState::Verifying || state == BatchState::WaitingConflict) return batch;
+    }
+    for (const auto& batch : batches)
+        if (!finished(batch->state.load())) return batch;
+    return batches.empty() ? nullptr : batches.back();
+}
+
 const char* batchStateLabel(const TransferBatch& batch) {
     auto state = batch.state.load();
     if (!finished(state) && batch.disconnected) return "Waiting for phone";
     if (batch.waitingConflict) return "Needs a decision";
     switch (state) {
+    case BatchState::Preparing: return "Scanning files";
     case BatchState::Queued: return "Queued";
     case BatchState::Running: return "Copying";
     case BatchState::Paused: return "Paused";
@@ -325,10 +341,10 @@ void App::renderPaneNavigation(FilePanel& panel) {
     ImGui::BeginChild("##PaneNavigation",ImVec2(0,height),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleVar();
     auto history=[&](int step) {
-        panel.navHistoryPos+=step;panel.currentPath=panel.navHistory[panel.navHistoryPos];
-        panel.selectedIndices.clear();panel.focusedIndex=-1;panel.searchFilter[0]=0;
-        panel.needsRefresh=true;panel.navigationTransitionPending=true;
-        strcpy_s(panel.pathInput,panel.currentPath.c_str());
+        panel.navHistoryPos += step;
+        const std::string path = panel.navHistory[panel.navHistoryPos];
+        navigateToDirectory(panel, path);
+        strcpy_s(panel.pathInput, panel.currentPath.c_str());
     };
     ImGui::BeginDisabled(panel.navHistoryPos<=0);
     if(ui::button("##Back",ui::Icon::Back,ui::Appearance::Quiet,ImVec2(26*s,28*s),"Back"))history(-1);
@@ -385,122 +401,184 @@ void App::renderPaneNavigation(FilePanel& panel) {
 }
 
 float App::transferDockHeight() {
-    const float s=ui::scale();
+    const float s = ui::scale();
     std::lock_guard<std::mutex> lock(m_batchMutex);
-    if(m_batchQueue.empty()||!m_prefs.transferDockExpanded) return ui::controlHeight()+10*s;
-    bool conflict=std::any_of(m_batchQueue.begin(),m_batchQueue.end(),[](const auto& batch){return batch->waitingConflict.load();});
-    return ((m_showTransferChannels?216.0f:132.0f)+(conflict?20.0f:0.0f))*s +
-        std::max(0.0f, ImGui::GetFontSize()-14*s)*(m_showTransferChannels?9:6);
+    if (m_batchQueue.empty()) return 0;
+    const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x-28*s);
+    const auto batch = visibleTransfer(m_batchQueue);
+    ui::TransferCardModel card;
+    card.canCancel = !finished(batch->state.load()) && !batch->stopRequested;
+    return ui::transferCardHeight(card,width)+16*s+
+        (m_showTransferChannels ? std::max(100*s,ImGui::GetTextLineHeightWithSpacing()*4)+12*s : 0);
 }
 
 void App::renderTransferDock(float height) {
-    const float s=ui::scale();
+    if (height <= 0) return;
+    const float s = ui::scale();
     std::vector<std::shared_ptr<TransferBatch>> batches;
-    { std::lock_guard<std::mutex> lock(m_batchMutex);batches.assign(m_batchQueue.begin(),m_batchQueue.end()); }
-    std::shared_ptr<TransferBatch> batch;
-    int queued=0;
-    for(auto& b:batches) {
-        if(b->state==BatchState::Queued)++queued;
-        if(!batch&&!finished(b->state.load()))batch=b;
+    { std::lock_guard<std::mutex> lock(m_batchMutex); batches.assign(m_batchQueue.begin(),m_batchQueue.end()); }
+    if (batches.empty()) return;
+    auto batch = visibleTransfer(batches);
+    int queued = 0;
+    for (auto& candidate : batches) {
+        const auto state = candidate->state.load();
+        if (state == BatchState::Queued) ++queued;
     }
-    if(!batch&&!batches.empty())batch=batches.back();
-    if(batch&&batch!=m_lastDockBatch.lock()) {
-        m_lastDockBatch=batch;
-        if(!finished(batch->state.load()))m_prefs.transferDockExpanded=true;
-    }
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(18*s,5*s));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,0);
-    ImGui::BeginChild("##TransferDock",ImVec2(0,height),ImGuiChildFlags_Borders,ImGuiWindowFlags_NoScrollbar);
-    if(ui::button("Transfers",ui::Icon::Transfer)) {m_prefs.transferDockExpanded=!m_prefs.transferDockExpanded;m_prefs.save();}
-    ImGui::SameLine();ImGui::AlignTextToFramePadding();
-    if(batch)ImGui::TextDisabled("%s%s",batchStateLabel(*batch),queued>0?("  |  "+std::to_string(queued)+" queued").c_str():"");
-    else ImGui::TextDisabled("No transfers. Select files and choose Copy.");
-    float controlsWidth=batch?ImGui::CalcTextSize("Details").x+135*s:50*s;
-    ImGui::SameLine(std::max(ImGui::GetCursorPosX(),ImGui::GetWindowWidth()-controlsWidth));
-    if(batch) {
-        if(ui::button("Details",ui::Icon::Info)) {m_transferDetailsBatch=batch;m_overlayVisible=true;}
-        ImGui::SameLine(0,4*s);
-        if(ui::button("##TransferChannels",ui::Icon::Settings,ui::Appearance::Quiet,ImVec2(32*s,32*s),"Connection speeds and queued transfers")) {
-            m_showTransferChannels=!m_showTransferChannels;m_prefs.transferDockExpanded=true;
+
+    const auto state = batch->state.load();
+    const bool done = finished(state);
+    const bool preparing = state == BatchState::Preparing;
+    const bool waiting = batch->waitingConflict && !done;
+    const bool disconnected = batch->disconnected && !done;
+    const bool cancelling = batch->stopRequested && !done;
+    const bool paused = !done && (state == BatchState::Paused || batch->pauseRequested);
+    const bool running = state == BatchState::Running && !disconnected && !paused && !cancelling;
+    const bool completed = state == BatchState::Completed;
+    const bool errors = state == BatchState::Failed || (completed && (batch->errorSkippedFiles > 0 || batch->crcFailCount() > 0));
+    const int count = preparing ? 0 : batch->totalFiles();
+    const uint64_t transferred = batch->totalTransferred.load();
+    const uint64_t total = batch->totalBytes.load();
+    const std::string source = batch->isLocalCopy || (!batch->isPull && !batch->isCrossDevice) ? "This PC" : deviceDisplayName(batch->srcDeviceSlot);
+    const std::string destination = batch->isLocalCopy || (batch->isPull && !batch->isCrossDevice) ? "This PC" : deviceDisplayName(batch->dstDeviceSlot);
+
+    ui::TransferCardModel card;
+    card.heading = cancelling ? "Cancelling transfer" : waiting ? "Your decision is needed" : disconnected ? "Connection interrupted" :
+        errors ? (completed ? "Finished with errors" : "Transfer failed") : completed ? "Transfer complete" :
+        paused ? "Transfer paused" : state == BatchState::Stopped ? "Transfer cancelled" :
+        preparing ? "Preparing transfer" : state == BatchState::Queued ? "Transfer queued" :
+        state == BatchState::Verifying ? "Checking your files" : batch->isMove ? "Moving your files" : "Copying your files";
+    card.tone = cancelling || state == BatchState::Stopped ? ui::TransferTone::Neutral :
+        waiting || disconnected || paused ? ui::TransferTone::Attention : errors ? ui::TransferTone::Error :
+        completed ? ui::TransferTone::Success : ui::TransferTone::Active;
+    card.route = source+"  >  "+destination;
+    card.filename = preparing ? "Finding files and folders" : count == 1 ? batch->files.front().displayName : std::to_string(count)+" items";
+    card.amount = preparing ? std::to_string(batch->discoveredItems.load())+" items found" :
+        formatSize(transferred)+" of "+formatSize(total);
+    card.progress = completed ? 1.0f : state == BatchState::Verifying ? batch->crcProgress.load() : batch->totalProgress.load();
+    card.indeterminate = preparing || state == BatchState::Queued || cancelling;
+    card.paused = paused;
+    card.canCancel = !done && !cancelling;
+    card.canReview = waiting && !cancelling;
+    card.canRetry = disconnected && !waiting && !cancelling;
+    card.canPause = !waiting && !disconnected && !cancelling && (state == BatchState::Running || state == BatchState::Paused);
+    card.showChannels = m_showTransferChannels;
+    card.queued = std::max(0,queued-(state == BatchState::Queued ? 1 : 0));
+    if (waiting) {
+        card.detail = "A file already exists at the destination. Choose Replace or Skip to continue.";
+        card.metric = "Waiting for you";
+    } else if (disconnected) {
+        card.detail = "Reconnect your device to continue, or choose Retry now.";
+        card.metric = "Waiting for device";
+    } else if (errors) {
+        card.detail = "Some files could not be transferred or checked. Open Details to review.";
+        card.metric = "Review errors";
+        card.eta = "Saved in Activity log";
+    } else if (completed) {
+        card.detail = batch->skippedFiles > 0 ? std::to_string(batch->skippedFiles)+" skipped, as requested" :
+            !batch->crcResults.empty() ? "Files checked successfully" : "All items transferred";
+        card.metric = formatSpeed(batch->finalAvgSpeed.load())+" average";
+        card.eta = "Finished in "+formatETA(batch->finalTimeSec.load());
+    } else if (state == BatchState::Stopped) {
+        card.detail = "Transfer stopped. Details are saved in Activity log.";
+    } else if (cancelling) {
+        card.detail = "Stopping active connections...";
+    } else if (preparing) {
+        card.detail = "You can keep browsing while your files are prepared.";
+    } else if (state == BatchState::Queued) {
+        card.detail = "Starts automatically when the current transfer finishes.";
+    } else if (paused) {
+        card.detail = "Choose Resume when you are ready to continue.";
+    } else if (state == BatchState::Verifying) {
+        card.detail = "Checking that the copied files match the originals.";
+        card.metric = "Verifying";
+    } else {
+        card.detail = count > 1 ? std::to_string(std::min(batch->completedFiles(),count))+" of "+std::to_string(count)+" items finished" :
+            count == 1 ? "To "+parentPath(batch->files.front().destPath) : "Preparing files...";
+        if (running) {
+            const double speed = batch->speedBytesPerSec.load();
+            card.metric = speed > 0 ? formatSpeed(speed) : "Starting...";
+            const double eta = batch->etaSeconds.load();
+            if (eta >= 0) card.eta = formatETA(eta)+" remaining";
         }
-        ImGui::SameLine(0,4*s);
     }
-    if(ui::button("##CollapseTransfers",m_prefs.transferDockExpanded?ui::Icon::Down:ui::Icon::Up,ui::Appearance::Quiet,ImVec2(32*s,32*s),"Expand or collapse transfer queue")) {m_prefs.transferDockExpanded=!m_prefs.transferDockExpanded;m_prefs.save();}
-    if(batch&&m_prefs.transferDockExpanded) {
-        ImGui::Separator();
-        bool done=finished(batch->state.load());
-        if(ImGui::BeginTable("##DockJob",3,ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("Route",ImGuiTableColumnFlags_WidthStretch,0.50f);
-            ImGui::TableSetupColumn("Progress",ImGuiTableColumnFlags_WidthStretch,0.34f);
-            ImGui::TableSetupColumn("Actions",ImGuiTableColumnFlags_WidthFixed,142*s);
-            ImGui::TableNextRow();ImGui::TableNextColumn();
-            std::string source=batch->isLocalCopy||(!batch->isPull&&!batch->isCrossDevice)?"This PC":deviceDisplayName(batch->srcDeviceSlot);
-            std::string destination=batch->isLocalCopy||batch->isPull?"This PC":deviceDisplayName(batch->dstDeviceSlot);
-            ui::textClipped(source+"  >  "+destination,ImGui::GetContentRegionAvail().x,ImGui::GetColorU32(ImGuiCol_Text));
-            if(!batch->files.empty())ui::textClipped(parentPath(batch->files.front().sourcePath)+"  >  "+parentPath(batch->files.front().destPath),ImGui::GetContentRegionAvail().x,ImGui::GetColorU32(ImGuiCol_TextDisabled));
-            ImGui::TableNextColumn();
-            bool running=batch->state==BatchState::Running&&!batch->disconnected;
-            ImGui::TextUnformatted(running?formatSpeed(batch->speedBytesPerSec.load()).c_str():batchStateLabel(*batch));
-            if(running&&batch->etaSeconds>=0) {ImGui::SameLine();ImGui::TextDisabled("%s left",formatETA(batch->etaSeconds.load()).c_str());}
-            float fraction=batch->state==BatchState::Verifying?batch->crcProgress.load():batch->totalProgress.load();
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram,ImGui::GetStyleColorVec4(ImGuiCol_CheckMark));
-            ImGui::ProgressBar(std::clamp(fraction,0.0f,1.0f),ImVec2(-1,5*s),"");ImGui::PopStyleColor();
-            ImGui::TextDisabled("%s of %s",formatSize(batch->totalTransferred.load()).c_str(),formatSize(batch->totalBytes.load()).c_str());
-            ImGui::TableNextColumn();
-            if(done) {
-                if(ui::button("View log",ui::Icon::File,ui::Appearance::Secondary)) {
-                    strcpy_s(m_debugTagFilter,("#"+std::to_string(batch->logId)).c_str());
-                    m_debugLevelFilter=0;m_showDebugWindow=true;
-                }
-                ImGui::SameLine(0,3*s);
-                if(ui::button("##DismissDockJob",ui::Icon::Close,ui::Appearance::Quiet,ImVec2(30*s,32*s),"Dismiss completed transfer")) {
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(14*s,8*s));
+    ImGui::BeginChild("##TransferDock",ImVec2(0,height),ImGuiChildFlags_AlwaysUseWindowPadding,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    const auto action = ui::transferCard(card,ImGui::GetContentRegionAvail().x);
+    if (action == ui::TransferCardAction::Details) {
+        m_transferDetailsBatch = batch;
+        m_overlayVisible = true;
+    } else if (action == ui::TransferCardAction::Channels) {
+        m_showTransferChannels = !m_showTransferChannels;
+    } else if (action == ui::TransferCardAction::PauseResume) {
+        batch->logEvent(LogLevel::Info,paused ? "Resume requested" : "Pause requested");
+        {
+            std::lock_guard<std::mutex> lock(m_batchMutex);
+            batch->pauseRequested = !paused;
+        }
+        m_batchCV.notify_all();
+    } else if (action == ui::TransferCardAction::Retry) {
+        batch->logEvent(LogLevel::Info,"Retry requested");
+        {
+            std::lock_guard<std::mutex> lock(m_batchMutex);
+            ++batch->retryGeneration;
+            batch->userRetryRequested = true;
+        }
+        m_batchCV.notify_all();
+    } else if (action == ui::TransferCardAction::Review) {
+        m_transferAttentionFocus = true;
+    } else if (action == ui::TransferCardAction::Cancel) {
+        m_cancelDockBatch = batch;
+        ImGui::OpenPopup("##CancelDockTransfer");
+    }
+    if (ImGui::BeginPopup("##CancelDockTransfer")) {
+        auto pendingCancel = m_cancelDockBatch.lock();
+        if (!pendingCancel || finished(pendingCancel->state.load())) {
+            ImGui::CloseCurrentPopup();
+        } else {
+            ImGui::TextUnformatted("Cancel this transfer?");
+            ImGui::Spacing();
+            if (ui::button("Keep transferring",ui::Icon::Play,ui::Appearance::Primary)) ImGui::CloseCurrentPopup();
+            if (ui::button("Cancel transfer",ui::Icon::Close,ui::Appearance::Secondary)) {
+                pendingCancel->logEvent(LogLevel::Info,"Cancel requested");
+                {
                     std::lock_guard<std::mutex> lock(m_batchMutex);
-                    std::erase(m_batchQueue,batch);
+                    pendingCancel->requestStop();
+                    pendingCancel->userRetryRequested = false;
                 }
-            } else if(batch->disconnected) {
-                if(ui::button("Retry now",ui::Icon::Refresh,ui::Appearance::Secondary)) {batch->logEvent(LogLevel::Info,"Retry requested");++batch->retryGeneration;batch->userRetryRequested=true;m_batchCV.notify_all();}
-            } else {
-                bool paused=batch->state==BatchState::Paused||batch->pauseRequested;
-                ImGui::BeginDisabled(done||batch->state==BatchState::Verifying||batch->waitingConflict);
-                if(ui::button(paused?"Resume":"Pause",paused?ui::Icon::Play:ui::Icon::Pause,ui::Appearance::Secondary)) {batch->logEvent(LogLevel::Info,paused?"Resume requested":"Pause requested");batch->pauseRequested=!paused;m_batchCV.notify_all();}
-                ImGui::EndDisabled();
+                m_batchCV.notify_all();
+                ImGui::CloseCurrentPopup();
             }
-            if(!done) {
-                ImGui::SameLine(0,3*s);
-                if(ui::button("##CancelDockJob",ui::Icon::Close,ui::Appearance::Quiet,ImVec2(30*s,32*s),"Cancel this transfer")) ImGui::OpenPopup("##CancelDockTransfer");
-            }
-            if(ImGui::BeginPopup("##CancelDockTransfer")) {
-                ImGui::TextUnformatted("Cancel this transfer?");
-                if(ui::button("Cancel transfer",ui::Icon::Close,ui::Appearance::Secondary)) {batch->logEvent(LogLevel::Info,"Cancel requested");batch->stopRequested=true;batch->userRetryRequested=false;m_batchCV.notify_all();ImGui::CloseCurrentPopup();}
-                if(ui::button("Keep copying"))ImGui::CloseCurrentPopup();
-                ImGui::EndPopup();
-            }
-            ImGui::EndTable();
         }
-        if(batch->waitingConflict) {
-            if(ui::button("A destination file already exists. Review options",ui::Icon::Info,ui::Appearance::Selected)) {m_transferDetailsBatch=batch;m_overlayVisible=true;}
-        } else if(done&&batch->state==BatchState::Failed) ImGui::TextDisabled("Open Details to review transfer errors.");
-        else ImGui::TextDisabled("%d items  |  %s",batch->totalFiles(),batch->isLocalCopy?"Local file transfer":m_prefs.enableCrcVerification?"File checking enabled":"File checking disabled");
-        if(m_showTransferChannels) {
-            ImGui::Separator();
-            ImGui::BeginChild("##DockDetails",ImVec2(0,0),ImGuiChildFlags_None);
-            if(batch->useParallelChannels||batch->useMultiNic) {
-                for(int channel=0;channel<std::min(batch->numChannels,TransferBatch::MAX_CHANNELS);++channel) {
-                    auto& c=batch->channels[channel];
-                    ImGui::TextDisabled("%s: %s",c.channelName.c_str(),formatSpeed(done||batch->disconnected||batch->state==BatchState::Paused?0:c.speed.load()).c_str());
-                }
-            }
-            for(auto& queuedBatch:batches) {
-                if(queuedBatch==batch)continue;
-                ImGui::PushID(queuedBatch.get());
-                std::string label=std::string(batchStateLabel(*queuedBatch))+": "+std::to_string(queuedBatch->totalFiles())+" files";
-                if(ImGui::Selectable(label.c_str())) {m_transferDetailsBatch=queuedBatch;m_overlayVisible=true;}
-                ImGui::PopID();
-            }
-            ImGui::EndChild();
-        }
+        ImGui::EndPopup();
     }
-    ImGui::EndChild();ImGui::PopStyleVar(2);
+    if (m_showTransferChannels) {
+        ImGui::Spacing();
+        ImGui::BeginChild("##DockDetails",ImVec2(0,0),ImGuiChildFlags_None);
+        bool hasChannels = false;
+        for (int i = 0; i < TransferBatch::MAX_CHANNELS; ++i) {
+            const auto& channel = batch->channels[i];
+            const auto bytes = channel.bytesTransferred.load();
+            const auto assigned = channel.totalBytes.load();
+            const double speed = running ? channel.speed.load() : 0;
+            if (bytes == 0 && assigned == 0 && speed == 0) continue;
+            hasChannels = true;
+            ImGui::Text("Channel %d    %s    %s transferred",i+1,formatSpeed(speed).c_str(),formatSize(bytes).c_str());
+        }
+        if (!hasChannels) ImGui::TextDisabled("%s",done ? "Transfer finished" : "Connection speeds appear once transferring starts.");
+        for (auto& queuedBatch : batches) {
+            if (queuedBatch == batch || finished(queuedBatch->state.load())) continue;
+            ImGui::PushID(queuedBatch.get());
+            std::string label = std::string(batchStateLabel(*queuedBatch));
+            if (queuedBatch->state != BatchState::Preparing) label += ": "+std::to_string(queuedBatch->totalFiles())+" items";
+            if (ImGui::Selectable(label.c_str())) { m_transferDetailsBatch = queuedBatch; m_overlayVisible = true; }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
 }
 
 void App::renderWorkspaceDrawer() {
@@ -599,10 +677,7 @@ void App::renderWorkspaceDrawer() {
                         if(mcraw&&ui::button("Browse frames",ui::Icon::Folder,ui::Appearance::Secondary)) {
                             std::string path=panel->currentPath;char sep=panel->isAndroid?'/':'\\';if(!path.empty()&&path.back()!=sep)path+=sep;path+=name;
                             if(panel->isAndroid)navigateToDirectory(*panel,path);
-                            else postAsync("Opening MotionCam frames...",[this,panel,path](){
-                                std::string mounted=McrawMountManager::instance().mountMcraw(path);
-                                if(!mounted.empty()){panel->insideMcraw=true;panel->mcrawFilePath=path;navigateToDirectory(*panel,mounted);}
-                            });
+                            else requestMcrawMount(*panel,path);
                             m_workspaceDrawer=0;
                         }
                         if(ui::button("Rename",ui::Icon::File)){m_contextPanel=panel;m_contextIndex=index;strcpy_s(m_renameBuf,name.c_str());m_showRenamePopup=true;}

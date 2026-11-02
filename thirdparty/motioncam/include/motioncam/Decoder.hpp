@@ -40,6 +40,7 @@ namespace motioncam {
 
     class AudioChunkLoader {
         public:
+            virtual ~AudioChunkLoader() = default;
             virtual bool next(AudioChunk& output) = 0;
     };
     
@@ -67,6 +68,9 @@ namespace motioncam {
         
         // Number of channels in audio
         int numAudioChannels() const;
+
+        // Count PCM bytes from indexed chunk headers without reading sample data.
+        uint64_t audioSizeBytes() const;
         
         // Load all audio chunks.
         void loadAudio(std::vector<AudioChunk>& outAudioChunks);

@@ -138,6 +138,7 @@ void setTaskbarPaused() {
 static ID3D11Device*            g_pd3dDevice = nullptr;
 static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain*          g_pSwapChain = nullptr;
+static bool                    g_swapChainOccluded = false;
 static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
 static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
 
@@ -394,10 +395,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // Main loop
     bool done = false;
     while (!done) {
+        const auto frameStart = std::chrono::steady_clock::now();
         MSG msg;
-        bool hadMessage = false;
         while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
-            hadMessage = true;
             TranslateMessage(&msg);
             DispatchMessage(&msg);
             if (msg.message == WM_QUIT)
@@ -409,8 +409,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         if (!g_inSizeMove) // skip if WndProc is already rendering during resize
             RenderFrame();
 
-        if (!hadMessage && !app.wantsHighFps())
-            Sleep(33);
+        // Present may return immediately for a hidden or occluded window.
+        const bool background = !IsWindowVisible(hwnd) || IsIconic(hwnd) || g_swapChainOccluded;
+        const auto frameInterval = std::chrono::microseconds(
+            background ? 100000 : app.wantsHighFps() ? 16667 : 33333);
+        std::this_thread::sleep_until(frameStart + frameInterval);
     }
     g_pApp = nullptr;
 
@@ -508,11 +511,18 @@ static void RenderFrame() {
     g_pApp->render();
     ImGui::Render();
 
+    // Keep processing UI results in the background without submitting graphics.
+    if (!IsWindowVisible(g_mainHwnd) || IsIconic(g_mainHwnd)) return;
+    if (g_swapChainOccluded) {
+        if (g_pSwapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) return;
+        g_swapChainOccluded = false;
+    }
+
     const float clear_color[4] = { 0.00f, 0.00f, 0.00f, 1.00f };
     g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
     g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    g_pSwapChain->Present(1, 0);
+    g_swapChainOccluded = g_pSwapChain->Present(1, 0) == DXGI_STATUS_OCCLUDED;
 }
 
 #define RESIZE_TIMER_ID 1

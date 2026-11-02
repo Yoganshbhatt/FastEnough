@@ -91,14 +91,11 @@ std::vector<WindowsFileEntry> listLocalMcraw(const std::string& mcrawPath) {
                 int sr = meta["extraData"]["audioSampleRate"];
                 int ch = meta["extraData"]["audioChannels"];
                 if (sr > 0 && ch > 0) {
-                    std::vector<motioncam::AudioChunk> audioChunks;
-                    decoder.loadAudio(audioChunks);
-                    if (!audioChunks.empty()) {
-                        size_t totalSamples = 0;
-                        for (auto& c : audioChunks) totalSamples += c.second.size();
+                    uint64_t audioBytes = decoder.audioSizeBytes();
+                    if (audioBytes > 0) {
                         WindowsFileEntry fe;
                         fe.name = "audio.wav";
-                        fe.size = 44 + totalSamples * sizeof(int16_t);
+                        fe.size = 44 + audioBytes;
                         fe.dateModified = dateStr;
                         fe.isDirectory = false;
                         entries.push_back(std::move(fe));
@@ -770,9 +767,12 @@ static bool writeDngDirect(const std::string& outputPath,
     // Pre-allocate file size to avoid NTFS extent allocation during writes
     LARGE_INTEGER liSize;
     liSize.QuadPart = (LONGLONG)totalSize;
-    SetFilePointerEx(hFile, liSize, nullptr, FILE_BEGIN);
-    SetEndOfFile(hFile);
-    SetFilePointerEx(hFile, {}, nullptr, FILE_BEGIN);
+    if (!SetFilePointerEx(hFile, liSize, nullptr, FILE_BEGIN) ||
+        !SetEndOfFile(hFile) || !SetFilePointerEx(hFile, {}, nullptr, FILE_BEGIN)) {
+        CloseHandle(hFile);
+        try { std::filesystem::remove(outputPath); } catch (...) {}
+        return false;
+    }
 
     // 3 direct WriteFile calls — pixel data goes straight from decompressed buffer, ZERO COPY
     DWORD written;
@@ -799,7 +799,7 @@ static bool writeDngDirect(const std::string& outputPath,
 
     // 3. IFD + overflow trailer (~1KB)
     if (ok && !trailer.empty()) {
-        if (!WriteFile(hFile, trailer.data(), (DWORD)trailer.size(), &written, nullptr))
+        if (!WriteFile(hFile, trailer.data(), (DWORD)trailer.size(), &written, nullptr) || written != trailer.size())
             ok = false;
     }
 
@@ -906,6 +906,8 @@ bool extractLocalMcrawItem(const std::string& mcrawPath, const std::string& virt
             std::ofstream ofs(destPath, std::ios::binary);
             if (!ofs) return false;
             ofs.write(json.data(), json.size());
+            ofs.close();
+            if (!ofs) return false;
             if (progress) progress(json.size(), json.size());
             return true;
 
@@ -935,7 +937,7 @@ bool extractLocalMcrawItem(const std::string& mcrawPath, const std::string& virt
                 }
             }
 
-            audio.save(destPath);
+            if (!audio.save(destPath)) return false;
             if (progress) progress(1, 1);
             return true;
 
@@ -994,7 +996,8 @@ int extractLocalMcrawBatch(const std::string& mcrawPath,
     // Clamp writer thread count
     int hwThreads = (int)std::thread::hardware_concurrency();
     if (hwThreads < 1) hwThreads = 4;
-    if (threadCount <= 0) threadCount = std::max(2, hwThreads - 1); // leave 1 core for reader
+    if (threadCount <= 0) threadCount = std::min(4, std::max(1, hwThreads - 1));
+    threadCount = std::min(threadCount, 8);
     threadCount = std::min(threadCount, totalFrames);
     threadCount = std::max(threadCount, 1);
 
@@ -1012,6 +1015,8 @@ int extractLocalMcrawBatch(const std::string& mcrawPath,
     };
 
     const int QUEUE_CAPACITY = threadCount * 2; // keep writers fed without excessive memory
+    const size_t QUEUE_BYTES = 256 * 1024 * 1024;
+    size_t queuedBytes = 0;
     std::queue<std::unique_ptr<FrameWork>> workQueue;
     std::mutex queueMutex;
     std::condition_variable queueNotEmpty;
@@ -1033,6 +1038,7 @@ int extractLocalMcrawBatch(const std::string& mcrawPath,
                 if (workQueue.empty() && readerDone.load()) break;
                 work = std::move(workQueue.front());
                 workQueue.pop();
+                queuedBytes -= work->pixelData.size();
             }
             queueNotFull.notify_one();
 
@@ -1059,7 +1065,14 @@ int extractLocalMcrawBatch(const std::string& mcrawPath,
     std::vector<std::thread> writers;
     writers.reserve(threadCount);
     for (int i = 0; i < threadCount; i++) {
-        writers.emplace_back(writer);
+        try {
+            writers.emplace_back(writer);
+        } catch (...) {
+            readerDone.store(true);
+            queueNotEmpty.notify_all();
+            for (auto& thread : writers) thread.join();
+            throw;
+        }
     }
 
     // --- Reader: sequentially read + decompress frames, push to queue ---
@@ -1074,21 +1087,22 @@ int extractLocalMcrawBatch(const std::string& mcrawPath,
         nlohmann::json frameMeta;
         try {
             decoder.loadFrame(frameList[i], work->pixelData, frameMeta);
+            if (!parseDngParams(work->params, frameMeta, containerMeta)) continue;
+            adjustLevelsForBitDepth(work->params, reinterpret_cast<const uint16_t*>(work->pixelData.data()), work->pixelData.size() / 2);
         } catch (...) {
             continue; // skip bad frames
         }
 
-        if (!parseDngParams(work->params, frameMeta, containerMeta))
-            continue;
-        adjustLevelsForBitDepth(work->params, reinterpret_cast<const uint16_t*>(work->pixelData.data()), work->pixelData.size() / 2);
-
         // Push to bounded queue (block if full)
         {
             std::unique_lock<std::mutex> lk(queueMutex);
-            queueNotFull.wait(lk, [&] {
-                return (int)workQueue.size() < QUEUE_CAPACITY || (stopFlag && stopFlag->load());
-            });
+            while (!(stopFlag && stopFlag->load()) &&
+                   ((int)workQueue.size() >= QUEUE_CAPACITY ||
+                    (!workQueue.empty() && (queuedBytes >= QUEUE_BYTES ||
+                     work->pixelData.size() > QUEUE_BYTES - queuedBytes))))
+                queueNotFull.wait_for(lk, std::chrono::milliseconds(50));
             if (stopFlag && stopFlag->load()) break;
+            queuedBytes += work->pixelData.size();
             workQueue.push(std::move(work));
         }
         queueNotEmpty.notify_one();

@@ -170,7 +170,7 @@ public:
 
     // File operations via TCP server
     std::string detectStoragePath();
-    std::vector<DeviceFileEntry> listDirectory(const std::string& path);
+    std::vector<DeviceFileEntry> listDirectory(const std::string& path, bool* succeeded = nullptr);
     bool pullFile(const std::string& remotePath, const std::string& localPath,
                   uint64_t& outFileSize, ProgressCallback progress = nullptr);
     bool pushFile(const std::string& localPath, const std::string& remotePath,
@@ -231,6 +231,7 @@ public:
 
     // Create/truncate a file on the device with optional pre-allocation
     bool createFile(const std::string& remotePath, uint64_t totalSize = 0);
+    bool truncateFile(const std::string& remotePath, uint64_t totalSize);
 
     bool deleteFile(const std::string& path);
     bool createDirectory(const std::string& path);
@@ -264,7 +265,7 @@ public:
     bool connectDirect(const std::string& ip); // connect + verify + set state
     bool connectParallelFrom(const DeviceClient& source);
     void setOwnsServer(bool owns) { m_ownsServer = owns; }
-    void flushStaleData(); // drain any leftover data from TCP buffer after cancelled transfer
+    void flushStaleData(); // invalidate a stream with unread data after a cancelled transfer
     bool tryEnableUsbTethering(const std::string& serial = ""); // attempt to enable tethering via adb shell
     std::string detectDeviceIp(const std::string& serial);
     std::string runAdbCommand(const std::string& args, uint32_t timeoutMs = 30000);
@@ -276,6 +277,17 @@ public:
     std::string getServerBinaryPath();
 
 private:
+    void publishConnectionProfile();
+    void abortTransfer(const std::string& error);
+    bool receiveFileStream(const std::string& localPath, uint64_t totalSize, uint64_t offset,
+                           bool calculateCrc, ProgressCallback progress);
+    bool sendFileStream(void* file, uint64_t length, uint64_t progressOffset,
+                        bool calculateCrc, bool rangeWrite, ProgressCallback progress);
+    bool finishWrite(uint64_t expectedBytes, bool rangeWrite, uint32_t* crc = nullptr);
+    static bool relayStream(DeviceClient& src, DeviceClient& dst,
+                            const std::string& srcPath, const std::string& dstPath,
+                            uint64_t srcOffset, uint64_t dstOffset, uint64_t length,
+                            bool range, ProgressCallback progress, RelayRangeStats* stats);
     void stopDeviceServerProcesses(const std::string& serial);
     bool sendAll(const void* data, size_t len);
     bool recvAll(void* data, size_t len);
@@ -315,7 +327,7 @@ private:
     std::string m_adbPath;
     std::atomic<bool> m_cancelCommands{false};
     std::string m_serial;
-    uintptr_t m_socket = ~(uintptr_t)0; // INVALID_SOCKET
+    std::atomic<uintptr_t> m_socket{~(uintptr_t)0}; // INVALID_SOCKET
     std::atomic<bool> m_connected{false};
     int m_serverPort = AFM_PORT;
     bool m_directConnection = false; // true = direct IP, false = adb forward
@@ -328,12 +340,19 @@ private:
 
     // Independent control channel — second TCP connection used for small
     // browsing ops so they aren't serialized behind in-progress transfers.
-    uintptr_t m_ctlSocket = ~(uintptr_t)0;
+    std::atomic<uintptr_t> m_ctlSocket{~(uintptr_t)0};
     bool m_ctlConnected = false;
     std::mutex m_ctlMutex;
     std::string m_lastConnectHost;
     int m_lastConnectPort = 0;
     std::string m_lastConnectBindIp;
+    struct ConnectionProfile {
+        std::string host, bindIp, serial, adbPath, deviceIp;
+        int port = 0, serverPort = AFM_PORT;
+        bool direct = false, useRoot = false;
+    };
+    ConnectionProfile m_connectionProfile;
+    mutable std::mutex m_profileMutex;
 
     // When true, the server is launched and killed via `su -c` so it runs as
     // root and can access paths the shell user can't reach.
@@ -362,10 +381,9 @@ public:
     void setInlineCrc(uint32_t crc, const std::string& path) { m_inlineCrc = crc; m_inlineCrcPath = path; }
     uint32_t getInlineCrc() const { return m_inlineCrc; }
 
-    // Interrupt any blocking recv/send by setting a 1ms timeout.
-    // Call from another thread to unblock transfers for fast cancellation.
+    // Interrupt blocking transfer I/O. Reconnect before using this stream again.
     void interruptBlocking();
-    void restoreTimeouts(); // restore normal socket timeouts after interruptBlocking
+    void restoreTimeouts(); // restore normal timeouts on a usable socket
 };
 
 // CRC32 utilities for parallel/split-file verification

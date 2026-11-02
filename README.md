@@ -2,7 +2,7 @@
 
 A Windows desktop app for high-speed file management on Android devices over USB. It replaces `adb push` / `adb pull` with a custom binary TCP protocol and a small native daemon that runs on the device.
 
-Pre-built signed releases are published on the [Releases page](https://github.com/EkinStrop/FastEnough/releases) of this repository.
+Pre-built signed releases are published on the [Releases page](https://github.com/JohnTheFarm3r/FastEnough/releases) of this repository.
 
 > **A note before you read on.** This is a hobby project, built with significant help from AI tooling. It started as a personal answer to how painfully slow MTP is on Android, and most of the design decisions reflect a workflow I actually use, not a generic blueprint. The code is offered as-is. Bugs, rough edges, and missing features are part of the deal, and I make no promises about fixing them on any schedule.
 >
@@ -48,7 +48,7 @@ The wire format and command codes are defined in `server/protocol.h`.
 ### 1. Clone and fetch dependencies
 
 ```powershell
-git clone https://github.com/EkinStrop/FastEnough.git
+git clone https://github.com/JohnTheFarm3r/FastEnough.git
 cd FastEnough
 .\setup.ps1
 ```
@@ -157,4 +157,4 @@ Fast Enough is released under the [GNU General Public License v3.0](LICENSE). Yo
 
 ---
 
-Made by [@JohnTheFarmer](https://github.com/EkinStrop).
+Made by [@JohnTheFarm3r](https://github.com/JohnTheFarm3r).

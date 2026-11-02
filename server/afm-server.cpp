@@ -37,6 +37,8 @@
 #include <atomic>
 #include <mutex>
 #include <fstream>
+#include <limits>
+#include <memory>
 
 #include <motioncam/Decoder.hpp>
 #include <nlohmann/json.hpp>
@@ -52,7 +54,7 @@
 #define RENAME_NOREPLACE (1 << 0)
 #endif
 
-static int g_running = 1;
+static std::atomic<bool> g_running{true};
 
 // --- Helpers ---
 
@@ -73,6 +75,7 @@ static int send_all(int fd, const void* buf, size_t len) {
     const char* p = (const char*)buf;
     while (len > 0) {
         ssize_t n = send(fd, p, len, 0);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         p += n;
         len -= n;
@@ -84,6 +87,7 @@ static int recv_all(int fd, void* buf, size_t len) {
     char* p = (char*)buf;
     while (len > 0) {
         ssize_t n = recv(fd, p, len, 0);
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         p += n;
         len -= n;
@@ -197,24 +201,26 @@ static void handle_list(int fd, const char* path, uint32_t path_len) {
     }
 
     char* buf = (char*)malloc(256 * 1024);
+    if (!buf) { closedir(dir); send_error(fd, "Out of memory"); return; }
     size_t buf_size = 256 * 1024;
     size_t buf_used = 4;
     uint32_t count = 0;
 
     struct dirent* de;
-    while ((de = readdir(dir)) != NULL) {
+    int listing_error = 0;
+    while (true) {
+        errno = 0;
+        de = readdir(dir);
+        if (!de) { listing_error = errno; break; }
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
-
-        char fullpath[PATH_MAX];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", pathbuf, de->d_name);
 
         struct stat st;
         uint8_t type = 0;
         uint64_t size = 0;
         int64_t mtime = 0;
 
-        if (lstat(fullpath, &st) == 0) {
+        if (fstatat(dirfd(dir), de->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
             if (S_ISDIR(st.st_mode)) type = 1;
             else if (S_ISLNK(st.st_mode)) type = 2;
             else type = 0;
@@ -226,9 +232,13 @@ static void handle_list(int fd, const char* path, uint32_t path_len) {
         size_t entry_size = sizeof(FileEntryHeader) + name_len;
 
         while (buf_used + entry_size > buf_size) {
+            if (buf_size > UINT32_MAX / 2) { listing_error = EOVERFLOW; break; }
             buf_size *= 2;
-            buf = (char*)realloc(buf, buf_size);
+            char* grown = (char*)realloc(buf, buf_size);
+            if (!grown) { listing_error = ENOMEM; break; }
+            buf = grown;
         }
+        if (listing_error) break;
 
         FileEntryHeader* eh = (FileEntryHeader*)(buf + buf_used);
         eh->type = type;
@@ -240,6 +250,12 @@ static void handle_list(int fd, const char* path, uint32_t path_len) {
         count++;
     }
     closedir(dir);
+
+    if (listing_error) {
+        free(buf);
+        send_error(fd, strerror(listing_error));
+        return;
+    }
 
     memcpy(buf, &count, 4);
     send_ok(fd, buf, buf_used);
@@ -291,17 +307,17 @@ static void* send_thread_func(void* arg) {
 // falls back to table lookup otherwise.
 
 static uint32_t crc32_table[256];
-static int crc32_table_init = 0;
+static std::once_flag crc32_table_once;
 
 static void init_crc32_table(void) {
-    if (crc32_table_init) return;
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int j = 0; j < 8; j++)
-            c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
-        crc32_table[i] = c;
-    }
-    crc32_table_init = 1;
+    std::call_once(crc32_table_once, [] {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; j++)
+                c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+            crc32_table[i] = c;
+        }
+    });
 }
 
 #ifdef __aarch64__
@@ -309,13 +325,12 @@ static void init_crc32_table(void) {
 #ifndef HWCAP_CRC32
 #define HWCAP_CRC32 (1 << 7)
 #endif
-static int g_has_arm_crc = -1;
 static int check_arm_crc(void) {
-    if (g_has_arm_crc < 0) {
+    static const int has_arm_crc = [] {
         unsigned long hwcap = getauxval(AT_HWCAP);
-        g_has_arm_crc = (hwcap & HWCAP_CRC32) ? 1 : 0;
-    }
-    return g_has_arm_crc;
+        return (hwcap & HWCAP_CRC32) ? 1 : 0;
+    }();
+    return has_arm_crc;
 }
 #endif
 
@@ -451,6 +466,31 @@ static pthread_mutex_t g_crc_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char     g_cached_crc_path[PATH_MAX] = {};
 static uint32_t g_cached_crc = 0;
 static int      g_cached_crc_valid = 0;
+static struct stat g_cached_crc_stat{};
+
+static bool same_file_version(const struct stat& a, const struct stat& b) {
+    return a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_size == b.st_size &&
+        a.st_mtim.tv_sec == b.st_mtim.tv_sec && a.st_mtim.tv_nsec == b.st_mtim.tv_nsec &&
+        a.st_ctim.tv_sec == b.st_ctim.tv_sec && a.st_ctim.tv_nsec == b.st_ctim.tv_nsec;
+}
+
+static motioncam::Decoder& mcraw_decoder_for_path(const char* path) {
+    struct CachedDecoder {
+        std::string path;
+        struct stat version{};
+        std::unique_ptr<motioncam::Decoder> decoder;
+    };
+    thread_local CachedDecoder cache;
+    struct stat version{};
+    if (stat(path, &version) < 0) throw motioncam::IOException(strerror(errno));
+    if (!cache.decoder || cache.path != path || !same_file_version(cache.version, version)) {
+        cache.decoder.reset();
+        cache.decoder = std::make_unique<motioncam::Decoder>(std::string(path));
+        cache.path = path;
+        cache.version = version;
+    }
+    return *cache.decoder;
+}
 
 static void handle_pull(int fd, const char* path, uint32_t path_len) {
     char pathbuf[PATH_MAX];
@@ -467,7 +507,11 @@ static void handle_pull(int fd, const char* path, uint32_t path_len) {
     }
 
     struct stat st;
-    fstat(file_fd, &st);
+    if (fstat(file_fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        close(file_fd);
+        send_error(fd, "Cannot read file size");
+        return;
+    }
     uint64_t file_size = st.st_size;
 
     PullHeader ph = { file_size };
@@ -488,6 +532,7 @@ static void handle_pull(int fd, const char* path, uint32_t path_len) {
         size_t sent = 0;
         while (sent < chunk) {
             ssize_t n = sendfile(fd, file_fd, &offset, chunk - sent);
+            if (n < 0 && errno == EINTR) continue;
             if (n <= 0) { error = 1; break; }
             sent += n;
         }
@@ -497,6 +542,7 @@ static void handle_pull(int fd, const char* path, uint32_t path_len) {
 
     close(file_fd);
     if (!error) send_msg(fd, RSP_DONE, NULL, 0);
+    else shutdown(fd, SHUT_RDWR);
 }
 
 static void shell_quote(const char* in, char* out, size_t out_size) {
@@ -1505,6 +1551,7 @@ static void stream_file_and_remove(int fd, const char* file_path) {
         size_t sent = 0;
         while (sent < chunk) {
             ssize_t n = sendfile(fd, file_fd, &offset, chunk - sent);
+            if (n < 0 && errno == EINTR) continue;
             if (n <= 0) { error = 1; break; }
             sent += n;
         }
@@ -1514,6 +1561,7 @@ static void stream_file_and_remove(int fd, const char* file_path) {
     close(file_fd);
     unlink(file_path);
     if (!error) send_msg(fd, RSP_DONE, NULL, 0);
+    else shutdown(fd, SHUT_RDWR);
 }
 
 static void handle_archive_path(int fd, const char* payload, uint32_t payload_len) {
@@ -1677,6 +1725,7 @@ static void* async_writer_thread_func(void* arg) {
         while (written < task.len) {
             ssize_t w = pwrite(writer->file_fd, task.buf + written, task.len - written,
                                (off_t)(task.offset + written));
+            if (w < 0 && errno == EINTR) continue;
             if (w <= 0) {
                 pthread_mutex_lock(&writer->mutex);
                 writer->error = true;
@@ -1765,6 +1814,40 @@ static void async_writer_destroy(AsyncWriter* writer) {
     pthread_mutex_destroy(&writer->mutex);
 }
 
+static bool receive_file_stream(int fd, int file_fd, uint64_t offset, uint64_t length,
+                                uint32_t* checksum) {
+    AsyncWriter writer;
+    int depth = (int)std::min<uint64_t>(6, length / BUF_SIZE + 1);
+    if (!async_writer_start(&writer, file_fd, depth)) {
+        async_writer_destroy(&writer);
+        shutdown(fd, SHUT_RD);
+        return false;
+    }
+    uint64_t received = 0;
+    bool complete = false;
+    uint32_t crc = ~(uint32_t)0;
+    while (true) {
+        MsgHeader hdr;
+        if (recv_all(fd, &hdr, sizeof(hdr)) < 0) break;
+        if (hdr.cmd == RSP_DONE) {
+            complete = hdr.length == 0 && received == length;
+            break;
+        }
+        if (hdr.cmd != RSP_DATA || hdr.length == 0 || hdr.length > BUF_SIZE ||
+            hdr.length > length - received) break;
+        char* buffer = async_writer_acquire(&writer);
+        if (!buffer || recv_all(fd, buffer, hdr.length) < 0) break;
+        if (checksum) crc32_update_raw(&crc, buffer, hdr.length);
+        if (!async_writer_submit(&writer, buffer, hdr.length, offset + received)) break;
+        received += hdr.length;
+    }
+    if (!complete) shutdown(fd, SHUT_RD);
+    if (!async_writer_finish(&writer)) complete = false;
+    async_writer_destroy(&writer);
+    if (complete && checksum) *checksum = ~crc;
+    return complete;
+}
+
 static void handle_push(int fd, const void* payload, uint32_t payload_len) {
     if (payload_len < sizeof(PushHeader)) {
         send_error(fd, "Invalid push header");
@@ -1773,6 +1856,9 @@ static void handle_push(int fd, const void* payload, uint32_t payload_len) {
 
     PushHeader ph;
     memcpy(&ph, payload, sizeof(ph));
+    if (ph.file_size > (uint64_t)std::numeric_limits<off_t>::max()) {
+        send_error(fd, "File size out of range"); return;
+    }
     uint32_t path_len = payload_len - sizeof(PushHeader);
     char pathbuf[PATH_MAX];
     if (path_len >= PATH_MAX) { send_error(fd, "Path too long"); return; }
@@ -1804,61 +1890,27 @@ static void handle_push(int fd, const void* payload, uint32_t payload_len) {
 
     if (send_ok(fd, NULL, 0) < 0) { close(file_fd); return; }
 
-    uint64_t received = 0;
-    int error = 0;
+    uint32_t push_crc = 0;
+    bool complete = receive_file_stream(fd, file_fd, 0, ph.file_size, &push_crc);
+    if (fsync(file_fd) < 0) complete = false;
+    struct stat finished{};
+    if (fstat(file_fd, &finished) < 0) complete = false;
+    if (close(file_fd) < 0) complete = false;
 
-    // Inline CRC: compute while receiving (free — data is already in memory)
-    uint32_t push_crc = ~(uint32_t)0;
-
-    AsyncWriter writer;
-    if (!async_writer_start(&writer, file_fd, 6)) {
-        async_writer_destroy(&writer);
-        close(file_fd);
-        send_error(fd, "Failed to start writer");
-        return;
-    }
-
-    while (1) {
-        MsgHeader hdr;
-        if (recv_all(fd, &hdr, sizeof(hdr)) < 0) { error = 1; break; }
-        if (hdr.cmd == RSP_DONE) break;
-        if (hdr.cmd != RSP_DATA || hdr.length == 0) { error = 1; break; }
-        if (hdr.length > BUF_SIZE) { error = 1; break; }
-
-        char* recv_buf = async_writer_acquire(&writer);
-        if (!recv_buf) { error = 1; break; }
-        if (recv_all(fd, recv_buf, hdr.length) < 0) { error = 1; break; }
-
-        // CRC the received chunk before handing to write thread
-        crc32_update_raw(&push_crc, recv_buf, hdr.length);
-
-        if (!async_writer_submit(&writer, recv_buf, hdr.length, received)) {
-            error = 1;
-            break;
-        }
-        received += hdr.length;
-    }
-
-    if (!async_writer_finish(&writer))
-        error = 1;
-    async_writer_destroy(&writer);
-
-    fsync(file_fd);
-    close(file_fd);
-
-    if (error) {
-        pthread_mutex_lock(&g_crc_mutex);
-        g_cached_crc_valid = 0;
-        pthread_mutex_unlock(&g_crc_mutex);
-        send_error(fd, "Write error (partial file kept for resume)");
-    } else {
-        push_crc = ~push_crc;
-        pthread_mutex_lock(&g_crc_mutex);
+    pthread_mutex_lock(&g_crc_mutex);
+    g_cached_crc_valid = 0;
+    if (complete) {
         strncpy(g_cached_crc_path, pathbuf, PATH_MAX - 1);
         g_cached_crc_path[PATH_MAX - 1] = '\0';
         g_cached_crc = push_crc;
+        g_cached_crc_stat = finished;
         g_cached_crc_valid = 1;
-        pthread_mutex_unlock(&g_crc_mutex);
+    }
+    pthread_mutex_unlock(&g_crc_mutex);
+    if (!complete) {
+        send_error(fd, "Write error (partial file kept for resume)");
+        shutdown(fd, SHUT_RDWR);
+    } else {
         send_ok(fd, NULL, 0);
     }
 }
@@ -1953,19 +2005,22 @@ static void handle_crc32(int fd, const char* path, uint32_t path_len) {
     memcpy(pathbuf, path, path_len);
     pathbuf[path_len] = '\0';
 
-    // Check push CRC cache — instant return if this file was just pushed
+    int file_fd = open(pathbuf, O_RDONLY);
+    if (file_fd < 0) { send_error(fd, strerror(errno)); return; }
+    struct stat current{};
+    if (fstat(file_fd, &current) < 0) { close(file_fd); send_error(fd, "Cannot read file size"); return; }
+
     pthread_mutex_lock(&g_crc_mutex);
-    if (g_cached_crc_valid && strcmp(pathbuf, g_cached_crc_path) == 0) {
+    if (g_cached_crc_valid && strcmp(pathbuf, g_cached_crc_path) == 0 &&
+        same_file_version(current, g_cached_crc_stat)) {
         uint32_t crc = g_cached_crc;
         g_cached_crc_valid = 0;
         pthread_mutex_unlock(&g_crc_mutex);
+        close(file_fd);
         send_ok(fd, &crc, sizeof(crc));
         return;
     }
     pthread_mutex_unlock(&g_crc_mutex);
-
-    int file_fd = open(pathbuf, O_RDONLY);
-    if (file_fd < 0) { send_error(fd, strerror(errno)); return; }
 
     // 4MB read buffer (matches transfer chunk size)
     const size_t kBufSize = 4 * 1024 * 1024;
@@ -1974,13 +2029,18 @@ static void handle_crc32(int fd, const char* path, uint32_t path_len) {
 
     uint32_t crc = ~(uint32_t)0;
     ssize_t n;
-    while ((n = read(file_fd, buf, kBufSize)) > 0) {
+    while (true) {
+        n = read(file_fd, buf, kBufSize);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
         crc32_update_raw(&crc, buf, n);
     }
+    int read_error = n < 0 ? errno : 0;
     crc = ~crc;
     free(buf);
     close(file_fd);
 
+    if (read_error) { send_error(fd, strerror(read_error)); return; }
     send_ok(fd, &crc, sizeof(crc));
 }
 
@@ -2002,7 +2062,10 @@ static void handle_sha256(int fd, const char* path, uint32_t path_len) {
     sha256_init(&ctx);
 
     ssize_t n;
-    while ((n = read(file_fd, buf, kBufSize)) > 0) {
+    while (true) {
+        n = read(file_fd, buf, kBufSize);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
         sha256_update(&ctx, (const uint8_t*)buf, (size_t)n);
     }
     if (n < 0) {
@@ -2042,7 +2105,11 @@ static void handle_read_range(int fd, const void* payload, uint32_t payload_len)
     }
 
     struct stat st;
-    fstat(file_fd, &st);
+    if (fstat(file_fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        close(file_fd);
+        send_error(fd, "Cannot read file size");
+        return;
+    }
     uint64_t file_size = st.st_size;
 
     // Clamp to file bounds
@@ -2077,6 +2144,7 @@ static void handle_read_range(int fd, const void* payload, uint32_t payload_len)
         size_t sent = 0;
         while (sent < chunk) {
             ssize_t n = sendfile(fd, file_fd, &sf_offset, chunk - sent);
+            if (n < 0 && errno == EINTR) continue;
             if (n <= 0) { error = 1; break; }
             sent += n;
         }
@@ -2086,6 +2154,7 @@ static void handle_read_range(int fd, const void* payload, uint32_t payload_len)
 
     close(file_fd);
     if (!error) send_msg(fd, RSP_DONE, NULL, 0);
+    else shutdown(fd, SHUT_RDWR);
 }
 
 // --- Write range handler (random byte-level write) ---
@@ -2096,6 +2165,10 @@ static void handle_write_range(int fd, const void* payload, uint32_t payload_len
     uint64_t offset, length;
     memcpy(&offset, payload, 8);
     memcpy(&length, (const char*)payload + 8, 8);
+    const uint64_t max_offset = (uint64_t)std::numeric_limits<off_t>::max();
+    if (offset > max_offset || length > max_offset - offset) {
+        send_error(fd, "Write range out of bounds"); return;
+    }
     uint32_t path_len = payload_len - 16;
     char pathbuf[PATH_MAX];
     if (path_len >= PATH_MAX) { send_error(fd, "Path too long"); return; }
@@ -2130,57 +2203,46 @@ static void handle_write_range(int fd, const void* payload, uint32_t payload_len
     // Send OK to signal ready for data
     if (send_ok(fd, NULL, 0) < 0) { close(file_fd); return; }
 
-    uint64_t written = 0;
-    int error = 0;
-    uint32_t range_crc = ~(uint32_t)0;
-
-    AsyncWriter writer;
-    if (!async_writer_start(&writer, file_fd, 6)) {
-        async_writer_destroy(&writer);
-        close(file_fd);
-        send_error(fd, "Failed to start writer");
-        return;
-    }
-
-    while (1) {
-        MsgHeader hdr;
-        if (recv_all(fd, &hdr, sizeof(hdr)) < 0) { error = 1; break; }
-        if (hdr.cmd == RSP_DONE) break;
-        if (hdr.cmd != RSP_DATA || hdr.length == 0) { error = 1; break; }
-        if (hdr.length > BUF_SIZE) { error = 1; break; }
-
-        char* recv_buf = async_writer_acquire(&writer);
-        if (!recv_buf) { error = 1; break; }
-        if (recv_all(fd, recv_buf, hdr.length) < 0) { error = 1; break; }
-        crc32_update_raw(&range_crc, recv_buf, hdr.length);
-
-        if (!async_writer_submit(&writer, recv_buf, hdr.length, offset + written)) {
-            error = 1;
-            break;
-        }
-        written += hdr.length;
-    }
-
-    if (!async_writer_finish(&writer))
-        error = 1;
-    async_writer_destroy(&writer);
-
-    // No fsync per block — kernel writeback handles persistence.
-    // File was pre-allocated by createFile; blocks are non-overlapping.
-    close(file_fd);
-
-    if (error) {
+    uint32_t range_crc = 0;
+    bool complete = receive_file_stream(fd, file_fd, offset, length, &range_crc);
+    if (close(file_fd) < 0) complete = false;
+    if (!complete) {
         send_error(fd, "Write failed");
+        shutdown(fd, SHUT_RDWR);
     } else {
-        range_crc = ~range_crc;
         struct {
             uint64_t written;
             uint32_t crc;
-        } resp;
-        resp.written = written;
+        } resp{};
+        resp.written = length;
         resp.crc = range_crc;
         send_ok(fd, &resp, sizeof(resp));
     }
+}
+
+static void handle_truncate_file(int fd, const void* payload, uint32_t payload_len) {
+    if (payload_len <= 8) { send_error(fd, "Invalid truncate request"); return; }
+    uint64_t size;
+    memcpy(&size, payload, 8);
+    if (size > (uint64_t)std::numeric_limits<off_t>::max()) {
+        send_error(fd, "File size out of range"); return;
+    }
+    uint32_t path_len = payload_len - 8;
+    char pathbuf[PATH_MAX];
+    if (path_len >= PATH_MAX) { send_error(fd, "Path too long"); return; }
+    memcpy(pathbuf, (const char*)payload + 8, path_len);
+    pathbuf[path_len] = '\0';
+    int file_fd = open(pathbuf, O_WRONLY);
+    if (file_fd < 0) { send_error(fd, strerror(errno)); return; }
+    int result;
+    do { result = ftruncate(file_fd, (off_t)size); } while (result < 0 && errno == EINTR);
+    int error = result < 0 ? errno : 0;
+    if (close(file_fd) < 0 && !error) error = errno;
+    pthread_mutex_lock(&g_crc_mutex);
+    if (strcmp(pathbuf, g_cached_crc_path) == 0) g_cached_crc_valid = 0;
+    pthread_mutex_unlock(&g_crc_mutex);
+    if (error) send_error(fd, strerror(error));
+    else send_ok(fd, NULL, 0);
 }
 
 static void handle_create_file(int fd, const void* payload, uint32_t payload_len) {
@@ -2188,6 +2250,9 @@ static void handle_create_file(int fd, const void* payload, uint32_t payload_len
 
     uint64_t total_size;
     memcpy(&total_size, payload, 8);
+    if (total_size > (uint64_t)std::numeric_limits<off_t>::max()) {
+        send_error(fd, "File size out of range"); return;
+    }
     uint32_t path_len = payload_len - 8;
     char pathbuf[PATH_MAX];
     if (path_len >= PATH_MAX) { send_error(fd, "Path too long"); return; }
@@ -2199,10 +2264,15 @@ static void handle_create_file(int fd, const void* payload, uint32_t payload_len
 
     // Pre-allocate if size known
     if (total_size > 0) {
-        ftruncate(file_fd, total_size);
+        if (ftruncate(file_fd, (off_t)total_size) < 0) {
+            int error = errno;
+            close(file_fd);
+            send_error(fd, strerror(error));
+            return;
+        }
     }
 
-    close(file_fd);
+    if (close(file_fd) < 0) { send_error(fd, strerror(errno)); return; }
     send_ok(fd, NULL, 0);
 }
 
@@ -2223,7 +2293,11 @@ static void handle_resume_pull(int fd, const void* payload, uint32_t payload_len
     if (file_fd < 0) { send_error(fd, strerror(errno)); return; }
 
     struct stat st;
-    fstat(file_fd, &st);
+    if (fstat(file_fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        close(file_fd);
+        send_error(fd, "Cannot read file size");
+        return;
+    }
     uint64_t file_size = st.st_size;
 
     if (offset > file_size) offset = file_size;
@@ -2247,6 +2321,7 @@ static void handle_resume_pull(int fd, const void* payload, uint32_t payload_len
         size_t sent = 0;
         while (sent < chunk) {
             ssize_t n = sendfile(fd, file_fd, &sf_offset, chunk - sent);
+            if (n < 0 && errno == EINTR) continue;
             if (n <= 0) { error = 1; break; }
             sent += n;
         }
@@ -2256,6 +2331,7 @@ static void handle_resume_pull(int fd, const void* payload, uint32_t payload_len
 
     close(file_fd);
     if (!error) send_msg(fd, RSP_DONE, NULL, 0);
+    else shutdown(fd, SHUT_RDWR);
 }
 
 static void handle_resume_push(int fd, const void* payload, uint32_t payload_len) {
@@ -2263,6 +2339,9 @@ static void handle_resume_push(int fd, const void* payload, uint32_t payload_len
 
     uint64_t total_size;
     memcpy(&total_size, payload, 8);
+    if (total_size > (uint64_t)std::numeric_limits<off_t>::max()) {
+        send_error(fd, "File size out of range"); return;
+    }
     uint32_t path_len = payload_len - 8;
     char pathbuf[PATH_MAX];
     if (path_len >= PATH_MAX) { send_error(fd, "Path too long"); return; }
@@ -2281,7 +2360,7 @@ static void handle_resume_push(int fd, const void* payload, uint32_t payload_len
 
     int file_fd;
     if (existing_size > 0) {
-        file_fd = open(pathbuf, O_WRONLY | O_APPEND);
+        file_fd = open(pathbuf, O_WRONLY);
     } else {
         file_fd = open(pathbuf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         existing_size = 0;
@@ -2291,53 +2370,12 @@ static void handle_resume_push(int fd, const void* payload, uint32_t payload_len
 
     if (send_ok(fd, &existing_size, sizeof(existing_size)) < 0) { close(file_fd); return; }
 
-    char* buf_a = (char*)malloc(BUF_SIZE + 64);
-    char* buf_b = (char*)malloc(BUF_SIZE + 64);
-    char* recv_buf = buf_a;
-    uint64_t received = 0;
-    int error = 0;
-
-    WriteJob wjob;
-    wjob.file_fd = file_fd;
-    wjob.active = 0;
-    wjob.error = 0;
-
-    while (1) {
-        MsgHeader hdr;
-        if (recv_all(fd, &hdr, sizeof(hdr)) < 0) { error = 1; break; }
-        if (hdr.cmd == RSP_DONE) break;
-        if (hdr.cmd != RSP_DATA || hdr.length == 0) { error = 1; break; }
-        if (recv_all(fd, recv_buf, hdr.length) < 0) { error = 1; break; }
-
-        if (wjob.active) {
-            pthread_join(wjob.thread, NULL);
-            wjob.active = 0;
-            if (wjob.error) { error = 1; break; }
-        }
-
-        wjob.buf = recv_buf;
-        wjob.len = hdr.length;
-        wjob.offset = existing_size + received;
-        wjob.error = 0;
-        wjob.active = 1;
-        pthread_create(&wjob.thread, NULL, write_thread_func, &wjob);
-
-        recv_buf = (recv_buf == buf_a) ? buf_b : buf_a;
-        received += hdr.length;
-    }
-
-    if (wjob.active) {
-        pthread_join(wjob.thread, NULL);
-        if (wjob.error) error = 1;
-    }
-
-    free(buf_a);
-    free(buf_b);
-    fsync(file_fd);
-    close(file_fd);
-
-    if (error) {
+    bool complete = receive_file_stream(fd, file_fd, existing_size, total_size - existing_size, nullptr);
+    if (fsync(file_fd) < 0) complete = false;
+    if (close(file_fd) < 0) complete = false;
+    if (!complete) {
         send_error(fd, "Write error (partial file kept for resume)");
+        shutdown(fd, SHUT_RDWR);
     } else {
         send_ok(fd, NULL, 0);
     }
@@ -2590,8 +2628,7 @@ static void handle_mcraw_list(int fd, const char* path, uint32_t path_len) {
     }
 
     try {
-        std::string pathStr(pathbuf);
-        motioncam::Decoder decoder(pathStr);
+        auto& decoder = mcraw_decoder_for_path(pathbuf);
         auto& frames = decoder.getFrames();
         auto& meta = decoder.getContainerMetadata();
 
@@ -2615,14 +2652,10 @@ static void handle_mcraw_list(int fd, const char* path, uint32_t path_len) {
                 int sr = meta["extraData"]["audioSampleRate"];
                 int ch = meta["extraData"]["audioChannels"];
                 if (sr > 0 && ch > 0) {
-                    // Load audio to count samples for size estimate
-                    std::vector<motioncam::AudioChunk> audioChunks;
-                    decoder.loadAudio(audioChunks);
-                    if (!audioChunks.empty()) {
+                    uint64_t audioBytes = decoder.audioSizeBytes();
+                    if (audioBytes > 0) {
                         hasAudio = true;
-                        size_t totalSamples = 0;
-                        for (auto& c : audioChunks) totalSamples += c.second.size();
-                        audioEstSize = 44 + totalSamples * sizeof(int16_t); // WAV header + PCM
+                        audioEstSize = 44 + audioBytes;
                     }
                 }
             }
@@ -2637,25 +2670,22 @@ static void handle_mcraw_list(int fd, const char* path, uint32_t path_len) {
         // Count entries: metadata.json + frames + optional audio.wav
         uint32_t count = 1 + (uint32_t)frames.size() + (hasAudio ? 1 : 0);
 
-        // Allocate buffer for response
-        size_t buf_size = 256 * 1024;
-        char* buf = (char*)malloc(buf_size);
-        size_t buf_used = 4; // reserve for count
-
+        std::vector<char> buffer(4);
+        buffer.reserve(256 * 1024);
         auto addEntry = [&](const char* name, uint64_t size) {
-            uint32_t name_len = strlen(name);
+            uint32_t name_len = (uint32_t)strlen(name);
             size_t entry_size = sizeof(FileEntryHeader) + name_len;
-            while (buf_used + entry_size > buf_size) {
-                buf_size *= 2;
-                buf = (char*)realloc(buf, buf_size);
-            }
-            FileEntryHeader* eh = (FileEntryHeader*)(buf + buf_used);
-            eh->type = 0; // regular file
-            eh->size = size;
-            eh->mtime = mcraw_mtime;
-            eh->name_len = name_len;
-            memcpy(buf + buf_used + sizeof(FileEntryHeader), name, name_len);
-            buf_used += entry_size;
+            if (entry_size > UINT32_MAX - buffer.size())
+                throw std::runtime_error("MCRAW listing too large");
+            size_t position = buffer.size();
+            buffer.resize(position + entry_size);
+            FileEntryHeader header{};
+            header.type = 0;
+            header.size = size;
+            header.mtime = mcraw_mtime;
+            header.name_len = name_len;
+            memcpy(buffer.data() + position, &header, sizeof(header));
+            memcpy(buffer.data() + position + sizeof(header), name, name_len);
         };
 
         // metadata.json
@@ -2673,9 +2703,8 @@ static void handle_mcraw_list(int fd, const char* path, uint32_t path_len) {
             addEntry("audio.wav", audioEstSize);
         }
 
-        memcpy(buf, &count, 4);
-        send_ok(fd, buf, buf_used);
-        free(buf);
+        memcpy(buffer.data(), &count, 4);
+        send_ok(fd, buffer.data(), (uint32_t)buffer.size());
 
     } catch (std::exception& e) {
         send_error(fd, e.what());
@@ -2709,8 +2738,7 @@ static void handle_mcraw_extract(int fd, const void* payload, uint32_t payload_l
     vname[vname_len] = '\0';
 
     try {
-        std::string mcrawStr(mcraw_path);
-        motioncam::Decoder decoder(mcrawStr);
+        auto& decoder = mcraw_decoder_for_path(mcraw_path);
         auto& frames = decoder.getFrames();
         auto& containerMeta = decoder.getContainerMetadata();
 
@@ -2785,7 +2813,7 @@ static void handle_client(int client_fd) {
     int nodelay = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-    char* payload_buf = (char*)malloc(BUF_SIZE + PATH_MAX);
+    std::vector<char> payload;
 
     while (g_running) {
         MsgHeader hdr;
@@ -2796,9 +2824,14 @@ static void handle_client(int client_fd) {
             break;
         }
 
-        if (hdr.length > 0) {
-            if (recv_all(client_fd, payload_buf, hdr.length) < 0) break;
+        try {
+            payload.resize(std::max<uint32_t>(hdr.length, 1));
+        } catch (const std::bad_alloc&) {
+            send_error(client_fd, "Out of memory");
+            break;
         }
+        char* payload_buf = payload.data();
+        if (hdr.length > 0 && recv_all(client_fd, payload_buf, hdr.length) < 0) break;
 
         switch (hdr.cmd) {
             case CMD_PING:    handle_ping(client_fd); break;
@@ -2821,6 +2854,7 @@ static void handle_client(int client_fd) {
             case CMD_DISK_SPACE:    handle_disk_space(client_fd); break;
             case CMD_WRITE_RANGE:   handle_write_range(client_fd, payload_buf, hdr.length); break;
             case CMD_CREATE_FILE:   handle_create_file(client_fd, payload_buf, hdr.length); break;
+            case CMD_TRUNCATE_FILE: handle_truncate_file(client_fd, payload_buf, hdr.length); break;
             case CMD_ARCHIVE_PATH:  handle_archive_path(client_fd, payload_buf, hdr.length); break;
             case CMD_EXTRACT_ARCHIVE: handle_extract_archive(client_fd, payload_buf, hdr.length); break;
             case CMD_INSTALL_BATCH: handle_install_batch(client_fd, payload_buf, hdr.length); break;
@@ -2830,7 +2864,6 @@ static void handle_client(int client_fd) {
         }
     }
 
-    free(payload_buf);
     close(client_fd);
 }
 
@@ -2881,14 +2914,16 @@ int main(int argc, char** argv) {
         // Spawn a thread per client for parallel transfers
         pthread_t t;
         int* fd_ptr = (int*)malloc(sizeof(int));
+        if (!fd_ptr) { close(client_fd); continue; }
         *fd_ptr = client_fd;
-        pthread_create(&t, NULL, [](void* arg) -> void* {
+        int started = pthread_create(&t, NULL, [](void* arg) -> void* {
             int fd = *(int*)arg;
             free(arg);
             handle_client(fd);
             return NULL;
         }, fd_ptr);
-        pthread_detach(t);
+        if (started == 0) pthread_detach(t);
+        else { free(fd_ptr); close(client_fd); }
     }
 
     close(server_fd);

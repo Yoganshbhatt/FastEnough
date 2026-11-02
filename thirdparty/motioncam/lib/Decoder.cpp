@@ -164,6 +164,20 @@ namespace motioncam {
     int Decoder::numAudioChannels() const {
         return mMetadata["extraData"]["audioChannels"];
     }
+
+    uint64_t Decoder::audioSizeBytes() const {
+        uint64_t bytes = 0;
+        for (const auto& offset : mAudioOffsets) {
+            if (FSEEK(mFile, offset.offset, SEEK_SET) != 0)
+                throw IOException("Invalid audio offset");
+            Item item{};
+            read(&item, sizeof(item));
+            if (item.type != Type::AUDIO_DATA || item.size % sizeof(int16_t) != 0)
+                throw IOException("Invalid audio data");
+            bytes += item.size;
+        }
+        return bytes;
+    }
     
     void Decoder::loadAudio(std::vector<AudioChunk>& outAudioChunks) {
         for(const auto& o : mAudioOffsets) {

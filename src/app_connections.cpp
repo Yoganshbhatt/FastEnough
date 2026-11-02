@@ -650,9 +650,21 @@ void App::renderConnectionManager(FilePanel& panel) {
     for (int i = 0; i < 3; ++i) {
         ImVec2 p(origin.x + padding + (horizontalSteps ? i * (stepWidth + 12 * s) : 0),
             y + 76 * s + (horizontalSteps ? 0 : i * (stepHeight + 10 * s)));
-        ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + 21 * s, p.y + 21 * s), 21 * s,
+        const ImVec2 center(p.x + 21 * s, p.y + 21 * s);
+        ImGui::GetWindowDrawList()->AddCircleFilled(center, 21 * s,
             ImGui::GetColorU32(rgb(29, 72, 129)));
-        theme.label(ImVec2(p.x + 15 * s, p.y + 7 * s), std::to_string(i + 1), 20 * s, rgb(69, 210, 255), 21, true);
+        ImFont* numberFont = ui::semiboldFont ? ui::semiboldFont : ImGui::GetFont();
+        const char number[] = { static_cast<char>('1' + i), '\0' };
+        if (const auto* glyph = numberFont->FindGlyph(number[0])) {
+            const float fontSize = 21 * s;
+            const float glyphScale = fontSize / numberFont->FontSize;
+            // Center the visible numeral bounds, including the font's bearings.
+            const ImVec2 textPosition(
+                std::round(center.x - (glyph->X0 + glyph->X1) * glyphScale * 0.5f),
+                std::round(center.y - (glyph->Y0 + glyph->Y1) * glyphScale * 0.5f));
+            ImGui::GetWindowDrawList()->AddText(numberFont, fontSize, textPosition,
+                theme.color(rgb(69, 210, 255)), number);
+        }
         theme.label(ImVec2(p.x + 64 * s, p.y + 5 * s), stepTitles[i], stepWidth - 64 * s, theme.text, 13, true);
         ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), 13 * s, ImVec2(p.x + 64 * s, p.y + 29 * s),
             theme.color(theme.muted), stepDescriptions[i], nullptr, std::max(40 * s, stepWidth - 64 * s));

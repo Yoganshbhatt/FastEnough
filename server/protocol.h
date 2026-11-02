@@ -7,7 +7,7 @@
 
 #define AFM_PORT 5740
 #define AFM_MAGIC 0x41464D53  // "AFMS"
-#define AFM_VERSION 3
+#define AFM_VERSION 4
 #define AFM_CHUNK_SIZE (4 * 1024 * 1024)  // 4MB transfer chunks
 
 // Commands (client -> server)
@@ -37,6 +37,7 @@ enum {
     CMD_INSTALL_BATCH = 23, // payload: JSON manifest of staged APK groups
     CMD_RESTORE_BACKUP_ARCHIVE = 24, // payload: JSON restore manifest for a staged ZIP64 store archive
     CMD_CREATE_BACKUP_ARCHIVE = 25, // payload: JSON app selection, returns a device-local ZIP64 store archive
+    CMD_TRUNCATE_FILE = 26, // payload: [8B size][path], preserve existing prefix
 };
 
 // Responses (server -> client)

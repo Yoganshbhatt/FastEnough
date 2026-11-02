@@ -12,7 +12,6 @@
 #include <filesystem>
 #include <thread>
 #include <chrono>
-#include <future>
 #include <cstdlib>
 #include <condition_variable>
 #include <deque>
@@ -68,6 +67,82 @@ static std::string lastWin32ErrorText() {
     if (message) LocalFree(message);
     while (!result.empty() && (result.back() == '\r' || result.back() == '\n' || result.back() == '.')) result.pop_back();
     return result;
+}
+
+class TransferWorker {
+public:
+    TransferWorker() : m_thread([this] {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        for (;;) {
+            m_cv.wait(lock, [this] { return m_pending || m_stop; });
+            if (m_stop) return;
+            auto task = std::move(m_task);
+            lock.unlock();
+            bool result = false;
+            try { result = task(); } catch (...) {}
+            lock.lock();
+            m_result = result;
+            m_pending = false;
+            m_cv.notify_all();
+        }
+    }) {}
+
+    ~TransferWorker() {
+        wait();
+        { std::lock_guard<std::mutex> lock(m_mutex); m_stop = true; }
+        m_cv.notify_all();
+        m_thread.join();
+    }
+
+    void submit(std::function<bool()> task) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_task = std::move(task);
+        m_pending = true;
+        m_cv.notify_all();
+    }
+
+    bool wait() {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this] { return !m_pending; });
+        return m_result;
+    }
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::function<bool()> m_task;
+    bool m_pending = false;
+    bool m_stop = false;
+    bool m_result = true;
+    std::thread m_thread;
+};
+
+struct FileHandleCloser {
+    void operator()(void* file) const { if (file != INVALID_HANDLE_VALUE) CloseHandle(file); }
+};
+using TransferFileHandle = std::unique_ptr<void, FileHandleCloser>;
+
+static TransferFileHandle openTransferSource(const std::string& path, uint64_t offset,
+                                             uint64_t length, std::string& error, bool wholeFile = false) {
+    TransferFileHandle file(CreateFileW(toWide(path).c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE) {
+        error = "Failed to open local file: " + path + " (" + lastWin32ErrorText() + ")";
+        return {};
+    }
+    LARGE_INTEGER size{}, position{};
+    if (!GetFileSizeEx(file.get(), &size) || size.QuadPart < 0 ||
+        offset > (uint64_t)size.QuadPart || length > (uint64_t)size.QuadPart - offset ||
+        (wholeFile && length != (uint64_t)size.QuadPart)) {
+        error = "Source size changed before the transfer";
+        return {};
+    }
+    position.QuadPart = (LONGLONG)offset;
+    if (!SetFilePointerEx(file.get(), position, nullptr, FILE_BEGIN)) {
+        error = "Failed to seek local file: " + lastWin32ErrorText();
+        return {};
+    }
+    return file;
 }
 
 DeviceClient::DeviceClient() {
@@ -302,6 +377,8 @@ void DeviceClient::closeTrackDevices(uintptr_t sock) {
 }
 
 std::string DeviceClient::getServerBinaryPath() {
+    static std::mutex extractionMutex;
+    std::lock_guard<std::mutex> extractionLock(extractionMutex);
     // First check next to the exe (for development)
     char exePath[MAX_PATH];
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -316,33 +393,46 @@ std::string DeviceClient::getServerBinaryPath() {
     CreateDirectoryA(extractDir.c_str(), nullptr);
     std::string extractPath = extractDir + "\\afm-server";
 
-    // Check if already extracted and up to date (compare size with resource)
     HRSRC hRes = FindResource(nullptr, MAKEINTRESOURCE(200), RT_RCDATA);
     if (!hRes) return beside; // no embedded resource, fall back
 
     DWORD resSize = SizeofResource(nullptr, hRes);
+    HGLOBAL hData = LoadResource(nullptr, hRes);
+    if (!hData) return beside;
+    const char* data = (const char*)LockResource(hData);
+    if (!data) return beside;
     bool needExtract = true;
-    if (std::filesystem::exists(extractPath)) {
-        try {
-            if (std::filesystem::file_size(extractPath) == resSize)
-                needExtract = false; // same size, assume up to date
-        } catch (...) {}
+    {
+        std::ifstream cached(toFsPath(extractPath), std::ios::binary | std::ios::ate);
+        if (cached && cached.tellg() == (std::streamoff)resSize) {
+            cached.seekg(0);
+            std::vector<char> buffer(65536);
+            size_t offset = 0;
+            while (offset < resSize) {
+                size_t count = std::min<size_t>(buffer.size(), resSize - offset);
+                if (!cached.read(buffer.data(), (std::streamsize)count) ||
+                    memcmp(buffer.data(), data + offset, count) != 0) break;
+                offset += count;
+            }
+            needExtract = offset != resSize;
+        }
     }
 
     if (needExtract) {
-        HGLOBAL hData = LoadResource(nullptr, hRes);
-        if (!hData) return beside;
-        void* data = LockResource(hData);
-        if (!data) return beside;
-
-        HANDLE hFile = CreateFileW(toWide(extractPath).c_str(), GENERIC_WRITE, 0, nullptr,
+        std::string temporary = extractPath + "." + std::to_string(GetCurrentProcessId()) + ".tmp";
+        HANDLE hFile = CreateFileW(toWide(temporary).c_str(), GENERIC_WRITE, 0, nullptr,
                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            WriteFile(hFile, data, resSize, &written, nullptr);
-            CloseHandle(hFile);
-            LOG_INFO("Server", "Extracted embedded afm-server (" + std::to_string(resSize) + " bytes)");
+        if (hFile == INVALID_HANDLE_VALUE) { m_lastError = "Could not extract Android helper"; return beside; }
+        DWORD written = 0;
+        bool success = WriteFile(hFile, data, resSize, &written, nullptr) && written == resSize;
+        CloseHandle(hFile);
+        if (!success || !MoveFileExW(toWide(temporary).c_str(), toWide(extractPath).c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(toWide(temporary).c_str());
+            m_lastError = "Could not update Android helper";
+            return beside;
         }
+        LOG_INFO("Server", "Extracted embedded afm-server (" + std::to_string(resSize) + " bytes)");
     }
 
     return extractPath;
@@ -410,6 +500,7 @@ bool DeviceClient::tryDirectConnect(const std::string& ip, int port) {
         m_directConnection = true;
         m_serverPort = port;
         m_deviceIp = ip;
+        publishConnectionProfile();
         return true;
     }
     disconnectTcp();
@@ -437,14 +528,15 @@ bool DeviceClient::verifyConnection() {
     // Restore normal timeout
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
 
-    if (hdr.cmd != RSP_OK || payload.size() < 4) {
+    if (hdr.cmd != RSP_OK || payload.size() < 8) {
+        m_lastError = "Helper did not report a compatible protocol version";
         LOG_ERROR("TCP", "PING bad response: cmd=" + std::to_string(hdr.cmd) + " len=" + std::to_string(payload.size()));
         return false;
     }
     uint32_t magic;
     memcpy(&magic, payload.data(), 4);
     if (magic != AFM_MAGIC) { LOG_ERROR("TCP", "PING wrong magic: 0x" + std::to_string(magic)); return false; }
-    // Check protocol version if server provides it (backward compatible: old servers send 4 bytes)
+    // Every supported helper reports its protocol version.
     if (payload.size() >= 8) {
         uint32_t serverVersion;
         memcpy(&serverVersion, payload.data() + 4, 4);
@@ -1802,6 +1894,7 @@ bool DeviceClient::connectDirect(const std::string& ip) {
         m_connected = true;
         m_directConnection = true;
         m_deviceIp = ip;
+        publishConnectionProfile();
         // Remove adb forward if it was set
         if (!m_serial.empty())
             runAdbCommand("-s " + m_serial + " forward --remove tcp:" + std::to_string(m_localPort));
@@ -1824,6 +1917,7 @@ bool DeviceClient::connectDirectForSerial(const std::string& serial, const std::
         m_directConnection = true;
         m_deviceIp = ip;
         m_statusText = "Connected via WiFi failover";
+        publishConnectionProfile();
         LOG_INFO("Server", "Connected directly through WiFi failover: " + serial +
             " on helper port " + std::to_string(port));
         return true;
@@ -1880,81 +1974,37 @@ bool DeviceClient::tryEnableUsbTethering(const std::string& serial) {
 
 bool DeviceClient::tryUpgradeToDirect() {
     if (!m_connected || m_serial.empty() || m_directConnection) return m_directConnection;
-
     std::string ip = detectDeviceIp(m_serial);
     if (ip.empty()) return false;
-
-    // Try connecting directly to the device IP
-    SOCKET testSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (testSock == INVALID_SOCKET) return false;
-
-    DWORD timeout = 1500;
-    setsockopt(testSock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(AFM_PORT);
-    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
-
-    if (connect(testSock, (sockaddr*)&addr, sizeof(addr)) != 0) {
-        closesocket(testSock);
-        return false;
+    uintptr_t candidate = openServerSocket(ip, m_serverPort, "");
+    if (candidate == (uintptr_t)INVALID_SOCKET) return false;
+    MsgHeader header{};
+    std::vector<char> response;
+    bool valid = sendMsgOn(candidate, CMD_PING, nullptr, 0) && recvMsgOn(candidate, header, response);
+    uint32_t magic = 0, version = 0, uid = UINT32_MAX;
+    if (valid && header.cmd == RSP_OK && response.size() >= 12) {
+        memcpy(&magic, response.data(), 4);
+        memcpy(&version, response.data() + 4, 4);
+        memcpy(&uid, response.data() + 8, 4);
     }
-
-    // Verify with PING on the new socket
-    int bufsize2 = 4 * 1024 * 1024;
-    setsockopt(testSock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize2, sizeof(bufsize2));
-    setsockopt(testSock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize2, sizeof(bufsize2));
-    BOOL nd = TRUE;
-    setsockopt(testSock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
-
-    MsgHeader pingHdr = { CMD_PING, 0 };
-    if (send(testSock, (const char*)&pingHdr, sizeof(pingHdr), 0) != sizeof(pingHdr)) {
-        closesocket(testSock);
-        return false;
+    if (magic != AFM_MAGIC || version != AFM_VERSION || (m_useRoot && uid != 0)) {
+        closesocket((SOCKET)candidate); return false;
     }
-
-    MsgHeader respHdr;
-    char respBuf[64];
-    int n = recv(testSock, (char*)&respHdr, sizeof(respHdr), 0);
-    if (n != sizeof(respHdr) || respHdr.cmd != RSP_OK || respHdr.length < 4) {
-        closesocket(testSock);
-        return false;
-    }
-    // Recv loop to handle potential TCP fragmentation
     {
-        uint32_t toRecv = respHdr.length;
-        if (toRecv > sizeof(respBuf)) { closesocket(testSock); return false; }
-        int totalRecv = 0;
-        while ((uint32_t)totalRecv < toRecv) {
-            n = recv(testSock, respBuf + totalRecv, toRecv - totalRecv, 0);
-            if (n <= 0) { closesocket(testSock); return false; }
-            totalRecv += n;
-        }
-        if (totalRecv < 4) { closesocket(testSock); return false; }
-    }
-
-    uint32_t magic;
-    memcpy(&magic, respBuf, 4);
-    if (magic != AFM_MAGIC) { closesocket(testSock); return false; }
-
-    // Success - swap the socket
-    {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        // Close old connection (adb forward)
-        if (m_socket != (uintptr_t)INVALID_SOCKET)
-            closesocket((SOCKET)m_socket);
-        m_socket = (uintptr_t)testSock;
+        std::scoped_lock lock(m_mutex, m_ctlMutex);
+        if (!m_connected) { closesocket((SOCKET)candidate); return false; }
+        if (m_socket != (uintptr_t)INVALID_SOCKET) closesocket((SOCKET)m_socket);
+        closeControlChannelLocked();
+        m_socket = candidate;
         m_directConnection = true;
         m_deviceIp = ip;
+        m_serverIsRoot = uid == 0;
         m_lastConnectHost = ip;
-        m_lastConnectPort = AFM_PORT;
+        m_lastConnectPort = m_serverPort;
         m_lastConnectBindIp.clear();
+        publishConnectionProfile();
     }
-
-    // Remove adb forward since we don't need it anymore
     runAdbCommand("-s " + m_serial + " forward --remove tcp:" + std::to_string(m_localPort));
-
     return true;
 }
 
@@ -2053,26 +2103,42 @@ bool DeviceClient::connectTcp(const std::string& host, int port, const std::stri
         return false;
     }
     LOG_INFO("TCP", "Connected to " + host + ":" + std::to_string(port));
-    m_connected = true;
+    std::scoped_lock lock(m_mutex, m_ctlMutex);
+    if (m_socket != (uintptr_t)INVALID_SOCKET) closesocket((SOCKET)m_socket);
+    closeControlChannelLocked();
     m_socket = sockU;
     m_lastConnectHost = host;
     m_lastConnectPort = port;
     m_lastConnectBindIp = bindLocalIp;
+    publishConnectionProfile();
+    m_connected = true;
     return true;
 }
 
+void DeviceClient::publishConnectionProfile() {
+    std::lock_guard<std::mutex> lock(m_profileMutex);
+    m_connectionProfile = {m_lastConnectHost, m_lastConnectBindIp, m_serial, m_adbPath, m_deviceIp,
+        m_lastConnectPort, m_serverPort, m_directConnection, m_useRoot};
+}
+
 bool DeviceClient::connectParallelFrom(const DeviceClient& source) {
-    if (!source.m_connected || source.m_lastConnectHost.empty()) return false;
-    m_adbPath = source.m_adbPath;
-    m_serial = source.m_serial;
-    m_useRoot = source.m_useRoot;
-    m_serverIsRoot = source.m_serverIsRoot.load();
-    m_directConnection = source.m_directConnection;
-    m_deviceIp = source.m_deviceIp;
-    m_serverPort = source.m_serverPort;
+    if (&source == this) return false;
+    ConnectionProfile profile;
+    {
+        std::lock_guard<std::mutex> lock(source.m_profileMutex);
+        if (!source.m_connected || source.m_startServerActive) return false;
+        profile = source.m_connectionProfile;
+    }
+    if (profile.host.empty()) return false;
+    m_adbPath = profile.adbPath;
+    m_serial = profile.serial;
+    m_useRoot = profile.useRoot;
+    m_directConnection = profile.direct;
+    m_deviceIp = profile.deviceIp;
+    m_serverPort = profile.serverPort;
     m_ownsServer = false;
-    if (!connectTcp(source.m_lastConnectHost, source.m_lastConnectPort, source.m_lastConnectBindIp)) return false;
-    if (!verifyConnection()) {
+    if (!connectTcp(profile.host, profile.port, profile.bindIp)) return false;
+    if (!verifyConnection() || (m_useRoot && !m_serverIsRoot)) {
         disconnectTcp();
         return false;
     }
@@ -2157,10 +2223,18 @@ bool DeviceClient::runSmallOp(uint32_t cmd, const void* payload, uint32_t plen,
             if (ok) return true;
             // Channel died — close it; we'll fall back to primary.
             closeControlChannelLocked();
+            if (cmd == CMD_DELETE || cmd == CMD_MKDIR || cmd == CMD_RENAME || cmd == CMD_TRUNCATE_FILE) {
+                m_lastError = "Connection lost before the operation was confirmed. Refresh to check the result.";
+                return false;
+            }
         }
     }
     // Fall back to primary channel.
-    std::lock_guard<std::mutex> lk(m_mutex);
+    std::unique_lock<std::mutex> lk(m_mutex, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        m_lastError = "Control connection unavailable while a transfer is active";
+        return false;
+    }
     SOCKET sock = (SOCKET)m_socket;
     DWORD origTimeout = 10000;
     if (recvTimeoutMs) {
@@ -2178,42 +2252,38 @@ void DeviceClient::flushStaleData() {
     if (!m_connected) return;
     std::lock_guard<std::mutex> lk(m_mutex);
     SOCKET sock = (SOCKET)m_socket;
-    // Temporarily set a very short recv timeout to drain stale bytes
-    DWORD shortTimeout = 100; // 100ms
-    DWORD origTimeout = 10000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&shortTimeout, sizeof(shortTimeout));
-    char discard[4096];
-    int totalFlushed = 0;
-    while (true) {
-        int n = recv(sock, discard, sizeof(discard), 0);
-        if (n <= 0) break;
-        totalFlushed += n;
-        if (totalFlushed > 1024 * 1024) break; // safety cap
-    }
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
-    if (totalFlushed > 0)
-        LOG_INFO("TCP", "Flushed " + std::to_string(totalFlushed) + " bytes of stale data");
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(sock, &readable);
+    timeval immediate{};
+    int ready = select(0, &readable, nullptr, nullptr, &immediate);
+    if (ready < 0) { abortTransfer("Could not check transfer connection"); return; }
+    if (ready > 0) abortTransfer("Transfer connection has unread data and must reconnect");
 }
 
 void DeviceClient::interruptBlocking() {
     SOCKET sock = (SOCKET)m_socket;
     if (sock != INVALID_SOCKET) {
-        DWORD timeout = 1;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+        shutdown(sock, SD_BOTH);
+        m_connected = false;
     }
+    SOCKET control = (SOCKET)m_ctlSocket.load();
+    if (control != INVALID_SOCKET) shutdown(control, SD_BOTH);
 }
 
 void DeviceClient::restoreTimeouts() {
     SOCKET sock = (SOCKET)m_socket;
     if (sock != INVALID_SOCKET) {
-        DWORD timeout = 10000; // 10s default
+        DWORD timeout = 10000;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+        timeout = 30000;
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
     }
 }
 
 void DeviceClient::disconnectTcp() {
+    interruptBlocking();
+    std::scoped_lock lock(m_mutex, m_ctlMutex);
     if (m_socket != (uintptr_t)INVALID_SOCKET) {
         closesocket((SOCKET)m_socket);
         m_socket = (uintptr_t)INVALID_SOCKET;
@@ -2221,10 +2291,7 @@ void DeviceClient::disconnectTcp() {
     m_connected = false;
     m_directConnection = false;
     m_serverIsRoot = false;
-    {
-        std::lock_guard<std::mutex> lk(m_ctlMutex);
-        closeControlChannelLocked();
-    }
+    closeControlChannelLocked();
 }
 
 bool DeviceClient::sendAll(const void* data, size_t len) {
@@ -2293,322 +2360,216 @@ std::string DeviceClient::detectStoragePath() {
     return "/storage/emulated/0";
 }
 
-std::vector<DeviceFileEntry> DeviceClient::listDirectory(const std::string& path) {
-    std::vector<DeviceFileEntry> entries;
-    if (!m_connected) { LOG_ERROR("Files","List folder failed: "+path+": device not connected"); return entries; }
+static bool parseDirectoryEntries(const std::vector<char>& payload, std::vector<DeviceFileEntry>& entries) {
+    if (payload.size() < 4) return false;
+    uint32_t count = 0;
+    memcpy(&count, payload.data(), 4);
+    if (count > (payload.size() - 4) / (sizeof(FileEntryHeader) + 1)) return false;
+    entries.reserve(count);
+    size_t offset = 4;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (payload.size() - offset < sizeof(FileEntryHeader)) return false;
+        FileEntryHeader header{};
+        memcpy(&header, payload.data() + offset, sizeof(header));
+        offset += sizeof(header);
+        if (header.type > 2 || header.name_len == 0 || header.name_len > payload.size() - offset) return false;
+        std::string name(payload.data() + offset, header.name_len);
+        if (name == "." || name == ".." || name.find('\0') != std::string::npos || name.find('/') != std::string::npos)
+            return false;
+        entries.push_back({std::move(name), header.type, header.size, header.mtime});
+        offset += header.name_len;
+    }
+    return offset == payload.size();
+}
 
-    MsgHeader hdr; std::vector<char> payload;
-    if (!runSmallOp(CMD_LIST, path.data(), (uint32_t)path.size(), hdr, payload)) { LOG_ERROR("Files","List folder failed: "+path+": "+m_lastError); return entries; }
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(payload.data(), payload.size());
-        LOG_ERROR("Files","List folder failed: "+path+": "+m_lastError);
+std::vector<DeviceFileEntry> DeviceClient::listDirectory(const std::string& path, bool* succeeded) {
+    std::vector<DeviceFileEntry> entries;
+    if (succeeded) *succeeded = false;
+    m_lastError.clear();
+    if (!m_connected) { m_lastError = "Not connected"; return entries; }
+    MsgHeader header{};
+    std::vector<char> payload;
+    if (!runSmallOp(CMD_LIST, path.data(), (uint32_t)path.size(), header, payload)) {
+        if (m_lastError.empty()) m_lastError = "Directory request failed";
         return entries;
     }
-    if (hdr.cmd != RSP_OK || payload.size() < 4) { LOG_ERROR("Files","Invalid folder listing response: "+path); return entries; }
-
-    uint32_t count;
-    memcpy(&count, payload.data(), 4);
-
-    size_t offset = 4;
-    for (uint32_t i = 0; i < count && offset < payload.size(); i++) {
-        if (offset + sizeof(FileEntryHeader) > payload.size()) break;
-        FileEntryHeader feh;
-        memcpy(&feh, payload.data() + offset, sizeof(feh));
-        offset += sizeof(feh);
-        if (offset + feh.name_len > payload.size()) break;
-
-        DeviceFileEntry e;
-        e.type = feh.type;
-        e.size = feh.size;
-        e.mtime = feh.mtime;
-        e.name = std::string(payload.data() + offset, feh.name_len);
-        offset += feh.name_len;
-        entries.push_back(std::move(e));
+    if (header.cmd == RSP_ERROR) { m_lastError.assign(payload.begin(), payload.end()); return entries; }
+    if (header.cmd != RSP_OK || !parseDirectoryEntries(payload, entries)) {
+        m_lastError = "Invalid directory listing response";
+        entries.clear();
+        return entries;
     }
-
-    // Sort: dirs first, then by name
     std::sort(entries.begin(), entries.end(), [](const DeviceFileEntry& a, const DeviceFileEntry& b) {
         if (a.isDirectory() != b.isDirectory()) return a.isDirectory();
         return a.name < b.name;
     });
-
+    if (succeeded) *succeeded = true;
     return entries;
 }
 
 std::vector<DeviceFileEntry> DeviceClient::listMcraw(const std::string& mcrawPath) {
     std::vector<DeviceFileEntry> entries;
-    if (!m_connected) return entries;
-
-    MsgHeader hdr; std::vector<char> payload;
-    if (!runSmallOp(CMD_MCRAW_LIST, mcrawPath.data(), (uint32_t)mcrawPath.size(),
-                    hdr, payload, 30000)) {
-        LOG_ERROR("MCRAW", "listMcraw failed");
+    m_lastError.clear();
+    if (!m_connected) { m_lastError = "Not connected"; return entries; }
+    MsgHeader header{};
+    std::vector<char> payload;
+    if (!runSmallOp(CMD_MCRAW_LIST, mcrawPath.data(), (uint32_t)mcrawPath.size(), header, payload, 30000)) {
+        if (m_lastError.empty()) m_lastError = "MCRAW listing request failed";
         return entries;
     }
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(payload.data(), payload.size());
-        return entries;
+    if (header.cmd == RSP_ERROR) { m_lastError.assign(payload.begin(), payload.end()); return entries; }
+    if (header.cmd != RSP_OK || !parseDirectoryEntries(payload, entries)) {
+        m_lastError = "Invalid MCRAW listing response";
+        entries.clear();
     }
-    if (hdr.cmd != RSP_OK || payload.size() < 4) return entries;
-
-    // Parse identically to listDirectory — same wire format
-    uint32_t count;
-    memcpy(&count, payload.data(), 4);
-
-    size_t offset = 4;
-    for (uint32_t i = 0; i < count && offset < payload.size(); i++) {
-        if (offset + sizeof(FileEntryHeader) > payload.size()) break;
-        FileEntryHeader feh;
-        memcpy(&feh, payload.data() + offset, sizeof(feh));
-        offset += sizeof(feh);
-        if (offset + feh.name_len > payload.size()) break;
-
-        DeviceFileEntry e;
-        e.type = feh.type;
-        e.size = feh.size;
-        e.mtime = feh.mtime;
-        e.name = std::string(payload.data() + offset, feh.name_len);
-        offset += feh.name_len;
-        entries.push_back(std::move(e));
-    }
-
-    // No sorting needed — server returns in logical order (metadata, frames, audio)
     return entries;
 }
 
-bool DeviceClient::pullMcrawItem(const std::string& mcrawPath, const std::string& virtualName,
-                                  const std::string& localPath, uint64_t& outFileSize,
-                                  ProgressCallback progress) {
-    if (!m_connected) { m_lastError = "Not connected"; return false; }
-    std::lock_guard<std::mutex> lk(m_mutex);
+void DeviceClient::abortTransfer(const std::string& error) {
+    m_lastError = error;
+    m_inlineCrcPath.clear();
+    m_connected = false;
+    if (m_socket != (uintptr_t)INVALID_SOCKET) shutdown((SOCKET)m_socket, SD_BOTH);
+}
 
-    // Use a longer recv timeout — server needs to decompress frame and generate DNG
-    SOCKET sock = (SOCKET)m_socket;
-    DWORD longTimeout = 60000; // 60s for DNG generation
-    DWORD origTimeout = 10000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&longTimeout, sizeof(longTimeout));
-
-    // Build payload: [4B mcraw_path_len][mcraw_path][virtual_name]
-    uint32_t mpLen = (uint32_t)mcrawPath.size();
-    std::vector<char> extractPayload(4 + mpLen + virtualName.size());
-    memcpy(extractPayload.data(), &mpLen, 4);
-    memcpy(extractPayload.data() + 4, mcrawPath.data(), mpLen);
-    memcpy(extractPayload.data() + 4 + mpLen, virtualName.data(), virtualName.size());
-
-    if (!sendMsg(CMD_MCRAW_EXTRACT, extractPayload.data(), (uint32_t)extractPayload.size())) {
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+bool DeviceClient::receiveFileStream(const std::string& localPath, uint64_t totalSize,
+                                     uint64_t offset, bool calculateCrc, ProgressCallback progress) {
+    m_inlineCrcPath.clear();
+    if (totalSize > INT64_MAX || offset > totalSize) {
+        abortTransfer("Partial file is larger than the source");
         return false;
     }
-
-    // Receive response — identical to pullFile() from here on
-    MsgHeader hdr; std::vector<char> payload;
-    if (!recvMsg(hdr, payload)) {
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
-        LOG_ERROR("MCRAW", "pullMcrawItem recv failed, disconnecting to prevent desync");
-        m_connected = false;
-        closesocket(sock);
-        m_socket = INVALID_SOCKET;
+    if (progress && !progress(offset, totalSize)) { abortTransfer("Cancelled"); return false; }
+    TransferFileHandle file(CreateFileW(toWide(localPath).c_str(), GENERIC_WRITE, 0, nullptr,
+        offset ? OPEN_EXISTING : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE && !offset) {
+        std::error_code error;
+        std::filesystem::create_directories(toFsPath(localPath).parent_path(), error);
+        file.reset(CreateFileW(toWide(localPath).c_str(), GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    }
+    if (file.get() == INVALID_HANDLE_VALUE) {
+        abortTransfer("Failed to create local file: " + localPath + " (" + lastWin32ErrorText() + ")");
         return false;
     }
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(payload.data(), payload.size());
+    if (offset) {
+        LARGE_INTEGER currentSize{};
+        if (!GetFileSizeEx(file.get(), &currentSize) || currentSize.QuadPart < 0 ||
+            (uint64_t)currentSize.QuadPart != offset) {
+            abortTransfer("Partial file changed before resume"); return false;
+        }
+    }
+    LARGE_INTEGER position{};
+    position.QuadPart = (LONGLONG)offset;
+    if (!SetFilePointerEx(file.get(), position, nullptr, FILE_BEGIN)) {
+        abortTransfer("Failed to seek local file: " + lastWin32ErrorText());
         return false;
     }
-    if (hdr.cmd != RSP_OK || payload.size() < sizeof(PullHeader)) return false;
-
-    PullHeader ph;
-    memcpy(&ph, payload.data(), sizeof(ph));
-    outFileSize = ph.file_size;
-
-    HANDLE hFile = CreateFileW(toWide(localPath).c_str(), GENERIC_WRITE, 0, nullptr,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        m_lastError = "Failed to create local file: " + localPath;
-        // Drain server data to keep TCP stream in sync
+    if (calculateCrc) inlineCrcReset();
+    if (totalSize - offset <= AFM_CHUNK_SIZE) {
+        uint64_t received = offset;
         while (true) {
-            if (!recvAll(&hdr, sizeof(hdr))) break;
-            if (hdr.cmd == RSP_DONE) break;
-            if (hdr.cmd != RSP_DATA || hdr.length == 0) break;
-            if (m_transferBuf.size() < hdr.length) m_transferBuf.resize(hdr.length);
-            if (!recvAll(m_transferBuf.data(), hdr.length)) break;
+            MsgHeader header{};
+            if (!recvAll(&header, sizeof(header))) return false;
+            if (header.cmd == RSP_DONE) {
+                if (header.length || received != totalSize) { abortTransfer("Incomplete file response"); return false; }
+                if (calculateCrc) { m_inlineCrc = ~m_inlineCrc; m_inlineCrcPath = localPath; }
+                return true;
+            }
+            if (header.cmd != RSP_DATA || header.length == 0 || header.length > AFM_CHUNK_SIZE ||
+                header.length > totalSize - received) { abortTransfer("Invalid file data length"); return false; }
+            if (m_transferBuf.size() < header.length) m_transferBuf.resize(header.length);
+            if (!recvAll(m_transferBuf.data(), header.length)) return false;
+            DWORD written = 0;
+            if (!WriteFile(file.get(), m_transferBuf.data(), header.length, &written, nullptr) || written != header.length) {
+                abortTransfer("Failed to write local file"); return false;
+            }
+            if (calculateCrc) inlineCrcUpdate(m_transferBuf.data(), header.length);
+            received += header.length;
+            if (progress && !progress(received, totalSize)) { abortTransfer("Cancelled"); return false; }
         }
-        return false;
     }
-
-    uint64_t received = 0;
-    bool success = true;
-
-    // Double-buffered receive + write (same as pullFile but without inline CRC)
-    std::vector<char> bufA(AFM_CHUNK_SIZE), bufB(AFM_CHUNK_SIZE);
-    char* recvBuf = bufA.data();
-    std::future<bool> writeFut;
-
-    while (received < outFileSize && success) {
-        if (!recvAll(&hdr, sizeof(hdr))) { success = false; break; }
-        if (hdr.cmd == RSP_DONE) break;
-        if (hdr.cmd != RSP_DATA) { success = false; break; }
-        if (!recvAll(recvBuf, hdr.length)) { success = false; break; }
-
-        if (writeFut.valid()) {
-            if (!writeFut.get()) success = false;
-        }
-
-        auto writeBuf = recvBuf;
-        auto writeLen = hdr.length;
-        writeFut = std::async(std::launch::async, [hFile, writeBuf, writeLen]() {
-            DWORD written;
-            return WriteFile(hFile, writeBuf, writeLen, &written, nullptr) && written == writeLen;
-        });
-
-        recvBuf = (recvBuf == bufA.data()) ? bufB.data() : bufA.data();
-        received += hdr.length;
-
-        if (progress && !progress(received, outFileSize)) {
-            success = false;
-            m_lastError = "Cancelled";
+    std::vector<char> first(AFM_CHUNK_SIZE), second(AFM_CHUNK_SIZE);
+    char* buffer = first.data();
+    TransferWorker writer;
+    uint64_t received = offset;
+    bool complete = false;
+    while (true) {
+        MsgHeader header{};
+        if (!recvAll(&header, sizeof(header))) break;
+        if (header.cmd == RSP_DONE) {
+            complete = header.length == 0 && received == totalSize;
+            if (!complete) abortTransfer("Incomplete file response");
             break;
         }
-    }
-
-    if (writeFut.valid()) {
-        if (!writeFut.get()) success = false;
-    }
-
-    CloseHandle(hFile);
-
-    // ALWAYS drain remaining data until RSP_DONE to keep stream clean.
-    // The data loop exits when received >= outFileSize, but the server still
-    // sends RSP_DONE after all data. If we don't consume it, it poisons the
-    // next command on this socket.
-    if (m_connected) {
-        while (recvAll(&hdr, sizeof(hdr))) {
-            if (hdr.cmd == RSP_DONE) break;
-            if (hdr.cmd != RSP_DATA || hdr.length == 0) break;
-            if (m_transferBuf.size() < hdr.length) m_transferBuf.resize(hdr.length);
-            if (!recvAll(m_transferBuf.data(), hdr.length)) break;
+        if (header.cmd != RSP_DATA || header.length == 0 || header.length > AFM_CHUNK_SIZE ||
+            header.length > totalSize - received) {
+            abortTransfer("Invalid file data length");
+            break;
         }
+        if (!recvAll(buffer, header.length)) break;
+        if (!writer.wait()) { abortTransfer("Failed to write local file"); break; }
+        char* writeBuffer = buffer;
+        DWORD writeLength = header.length;
+        writer.submit([this, handle = file.get(), writeBuffer, writeLength, calculateCrc] {
+            DWORD written = 0;
+            if (!WriteFile(handle, writeBuffer, writeLength, &written, nullptr) || written != writeLength)
+                return false;
+            if (calculateCrc) inlineCrcUpdate(writeBuffer, writeLength);
+            return true;
+        });
+        received += header.length;
+        buffer = buffer == first.data() ? second.data() : first.data();
+        if (progress && !progress(received, totalSize)) { abortTransfer("Cancelled"); break; }
     }
+    if (!writer.wait()) { abortTransfer("Failed to write local file"); complete = false; }
+    if (!complete) {
+        abortTransfer(m_lastError.empty() ? "Incomplete file response" : m_lastError);
+        return false;
+    }
+    if (calculateCrc) { m_inlineCrc = ~m_inlineCrc; m_inlineCrcPath = localPath; }
+    return true;
+}
 
-    return success;
+bool DeviceClient::pullMcrawItem(const std::string& mcrawPath, const std::string& virtualName,
+                                 const std::string& localPath, uint64_t& outFileSize,
+                                 ProgressCallback progress) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_connected) { m_lastError = "Not connected"; return false; }
+    uint32_t pathLength = (uint32_t)mcrawPath.size();
+    std::vector<char> request(4 + pathLength + virtualName.size());
+    memcpy(request.data(), &pathLength, 4);
+    memcpy(request.data() + 4, mcrawPath.data(), pathLength);
+    memcpy(request.data() + 4 + pathLength, virtualName.data(), virtualName.size());
+    DWORD timeout = 60000;
+    setsockopt((SOCKET)m_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    MsgHeader header{};
+    std::vector<char> response;
+    bool ready = sendMsg(CMD_MCRAW_EXTRACT, request.data(), (uint32_t)request.size()) && recvMsg(header, response);
+    timeout = 10000;
+    setsockopt((SOCKET)m_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    if (!ready) { abortTransfer(m_lastError); return false; }
+    if (header.cmd == RSP_ERROR) { m_lastError.assign(response.begin(), response.end()); return false; }
+    if (header.cmd != RSP_OK || response.size() != sizeof(PullHeader)) {
+        abortTransfer("Invalid MCRAW response"); return false;
+    }
+    memcpy(&outFileSize, response.data(), sizeof(outFileSize));
+    return receiveFileStream(localPath, outFileSize, 0, false, progress);
 }
 
 bool DeviceClient::pullFile(const std::string& remotePath, const std::string& localPath,
                             uint64_t& outFileSize, ProgressCallback progress) {
-    if (!m_connected) { m_lastError = "Not connected"; LOG_ERROR("Transfer", "pullFile: not connected"); return false; }
-    LOG_INFO("Transfer", "pullFile START: " + remotePath + " -> " + localPath);
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    if (!sendMsg(CMD_PULL, remotePath.data(), (uint32_t)remotePath.size())) {
-        LOG_ERROR("Transfer", "pullFile: sendMsg CMD_PULL failed");
-        return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_connected) { m_lastError = "Not connected"; return false; }
+    MsgHeader header{};
+    std::vector<char> response;
+    if (!sendMsg(CMD_PULL, remotePath.data(), (uint32_t)remotePath.size()) || !recvMsg(header, response)) return false;
+    if (header.cmd == RSP_ERROR) { m_lastError.assign(response.begin(), response.end()); return false; }
+    if (header.cmd != RSP_OK || response.size() != sizeof(PullHeader)) {
+        abortTransfer("Invalid file response"); return false;
     }
-
-    MsgHeader hdr; std::vector<char> payload;
-    if (!recvMsg(hdr, payload)) return false;
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(payload.data(), payload.size());
-        return false;
-    }
-    if (hdr.cmd != RSP_OK || payload.size() < sizeof(PullHeader)) return false;
-
-    PullHeader ph;
-    memcpy(&ph, payload.data(), sizeof(ph));
-    outFileSize = ph.file_size;
-
-    // Open local file for writing
-    HANDLE hFile = CreateFileW(toWide(localPath).c_str(), GENERIC_WRITE, 0, nullptr,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        // Parent directory may not exist yet (race with parallel directory creation)
-        try { std::filesystem::create_directories(std::filesystem::path(toFsPath(localPath)).parent_path()); } catch (...) {}
-        hFile = CreateFileW(toWide(localPath).c_str(), GENERIC_WRITE, 0, nullptr,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    }
-    if (hFile == INVALID_HANDLE_VALUE) {
-        m_lastError = "Failed to create local file: " + localPath + " (" + lastWin32ErrorText() + ")";
-        while (recvAll(&hdr, sizeof(hdr))) {
-            if (hdr.cmd == RSP_DONE) break;
-            if (hdr.cmd != RSP_DATA || hdr.length == 0) break;
-            if (m_transferBuf.size() < hdr.length) m_transferBuf.resize(hdr.length);
-            if (!recvAll(m_transferBuf.data(), hdr.length)) break;
-        }
-        return false;
-    }
-
-    uint64_t received = 0;
-    bool success = true;
-    inlineCrcReset();
-
-    // Double-buffered pull: async write+CRC of previous chunk while recv blocks on next
-    size_t pullBufSize = AFM_CHUNK_SIZE;
-    std::vector<char> bufA(pullBufSize), bufB(pullBufSize);
-    char* recvBuf = bufA.data();
-    std::future<bool> writeFut;
-
-    bool gotDone = false;
-    while (true) {
-        if (!recvAll(&hdr, sizeof(hdr))) { success = false; break; }
-
-        if (hdr.cmd == RSP_DONE) { gotDone = true; break; }
-        if (hdr.cmd != RSP_DATA || hdr.length == 0) { success = false; break; }
-
-        if (!recvAll(recvBuf, hdr.length)) { success = false; break; }
-
-        // Wait for previous write+CRC to finish before swapping buffers
-        if (writeFut.valid()) {
-            if (!writeFut.get()) { success = false; break; }
-        }
-
-        if (progress && received > 0 && !progress(received, outFileSize)) {
-            success = false;
-            m_lastError = "Cancelled";
-            break;
-        }
-
-        // Launch async write+CRC for current chunk
-        char* writeBuf = recvBuf;
-        DWORD writeLen = hdr.length;
-        writeFut = std::async(std::launch::async, [this, writeBuf, writeLen, hFile, &received]() {
-            DWORD written;
-            if (!WriteFile(hFile, writeBuf, writeLen, &written, nullptr)) return false;
-            inlineCrcUpdate(writeBuf, writeLen);
-            received += written;
-            return true;
-        });
-
-        recvBuf = (recvBuf == bufA.data()) ? bufB.data() : bufA.data();
-    }
-
-    // Wait for last write+CRC
-    if (writeFut.valid()) {
-        if (!writeFut.get()) success = false;
-    }
-    if (success && progress) progress(received, outFileSize);
-
-    CloseHandle(hFile);
-
-    // Drain until RSP_DONE only if the main loop didn't already consume it.
-    // Without this, the drain loop would block on recv until timeout, then
-    // set m_connected=false — killing the connection after a successful pull.
-    if (m_connected && !gotDone) {
-        MsgHeader drainHdr;
-        while (recvAll(&drainHdr, sizeof(drainHdr))) {
-            if (drainHdr.cmd == RSP_DONE) break;
-            if (drainHdr.cmd != RSP_DATA || drainHdr.length == 0) break;
-            if (m_transferBuf.size() < drainHdr.length) m_transferBuf.resize(drainHdr.length);
-            if (!recvAll(m_transferBuf.data(), drainHdr.length)) break;
-        }
-    }
-
-    if (success) {
-        m_inlineCrc = ~m_inlineCrc;
-        m_inlineCrcPath = localPath;
-        LOG_INFO("Transfer", "pullFile OK: " + std::to_string(received) + " bytes received");
-    } else {
-        LOG_ERROR("Transfer", "pullFile FAILED: " + m_lastError);
-    }
-    return success;
+    memcpy(&outFileSize, response.data(), sizeof(outFileSize));
+    return receiveFileStream(localPath, outFileSize, 0, true, progress);
 }
 
 bool DeviceClient::archiveRemoteDirectory(const std::string& remotePath, const std::string& localTarPath, bool excludeCache,
@@ -2651,40 +2612,10 @@ bool DeviceClient::archiveRemoteDirectory(const std::string& remotePath, const s
     memcpy(&ph, payload.data(), sizeof(ph));
     outFileSize = ph.file_size;
 
-    try { std::filesystem::create_directories(toFsPath(localTarPath).parent_path()); } catch (...) {}
-    HANDLE hFile = CreateFileW(toWide(localTarPath).c_str(), GENERIC_WRITE, 0, nullptr,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        m_lastError = "Failed to create local archive: " + localTarPath;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
-        return false;
-    }
-
-    uint64_t received = 0;
-    bool success = true;
-    std::vector<char> buf(AFM_CHUNK_SIZE);
-    while (true) {
-        if (!recvAll(&hdr, sizeof(hdr))) { success = false; break; }
-        if (hdr.cmd == RSP_DONE) break;
-        if (hdr.cmd != RSP_DATA || hdr.length == 0 || hdr.length > AFM_CHUNK_SIZE) { success = false; break; }
-        if (!recvAll(buf.data(), hdr.length)) { success = false; break; }
-        DWORD written = 0;
-        if (!WriteFile(hFile, buf.data(), hdr.length, &written, nullptr) || written != hdr.length) {
-            m_lastError = "Failed to write local archive";
-            success = false;
-            break;
-        }
-        received += hdr.length;
-        if (progress && !progress(received, outFileSize)) {
-            m_lastError = "Cancelled";
-            success = false;
-            break;
-        }
-    }
-    CloseHandle(hFile);
+    bool success = receiveFileStream(localTarPath, outFileSize, 0, false, progress);
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
 
-    if (success) LOG_INFO("BackupServer", "Archive OK: " + std::to_string(received) + " bytes");
+    if (success) LOG_INFO("BackupServer", "Archive OK: " + std::to_string(outFileSize) + " bytes");
     else LOG_ERROR("BackupServer", "Archive FAILED: " + m_lastError);
     return success;
 }
@@ -2716,7 +2647,7 @@ bool DeviceClient::extractRemoteArchive(const std::string& localTarPath, const s
     DWORD origTimeout = 10000;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&longTimeout, sizeof(longTimeout));
     bool sent = sendMsg(CMD_EXTRACT_ARCHIVE, payload.data(), (uint32_t)payload.size());
-    MsgHeader hdr; std::vector<char> resp;
+    MsgHeader hdr{}; std::vector<char> resp;
     bool got = sent && recvMsg(hdr, resp);
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
     if (!got) return false;
@@ -2727,467 +2658,217 @@ bool DeviceClient::extractRemoteArchive(const std::string& localTarPath, const s
     return hdr.cmd == RSP_OK;
 }
 
+bool DeviceClient::finishWrite(uint64_t expectedBytes, bool rangeWrite, uint32_t* crc) {
+    MsgHeader header{};
+    std::vector<char> response;
+    if (!sendMsg(RSP_DONE) || !recvMsg(header, response)) { abortTransfer("No write confirmation"); return false; }
+    if (header.cmd == RSP_ERROR) { abortTransfer(std::string(response.begin(), response.end())); return false; }
+    if (header.cmd != RSP_OK) { abortTransfer("Invalid write confirmation"); return false; }
+    if (rangeWrite) {
+        uint64_t written = 0;
+        if (response.size() >= sizeof(written)) memcpy(&written, response.data(), sizeof(written));
+        if (response.size() < sizeof(written) || written != expectedBytes) {
+            abortTransfer("Incomplete write confirmation"); return false;
+        }
+        if (crc) {
+            if (response.size() < 12) { abortTransfer("Missing range checksum"); return false; }
+            memcpy(crc, response.data() + 8, 4);
+        }
+    }
+    return true;
+}
+
+bool DeviceClient::sendFileStream(void* file, uint64_t length, uint64_t progressOffset,
+                                  bool calculateCrc, bool rangeWrite, ProgressCallback progress) {
+    m_inlineCrcPath.clear();
+    if (calculateCrc) inlineCrcReset();
+    if (length <= AFM_CHUNK_SIZE) {
+        if (progress && !progress(progressOffset, progressOffset + length)) { abortTransfer("Cancelled"); return false; }
+        if (length) {
+            size_t size = sizeof(MsgHeader) + (size_t)length;
+            if (m_transferBuf.size() < size) m_transferBuf.resize(size);
+            DWORD count = 0;
+            if (!ReadFile(file, m_transferBuf.data() + sizeof(MsgHeader), (DWORD)length, &count, nullptr) || count != length) {
+                abortTransfer("Failed to read complete local file range"); return false;
+            }
+            if (calculateCrc) inlineCrcUpdate(m_transferBuf.data() + sizeof(MsgHeader), count);
+            MsgHeader header{RSP_DATA, count};
+            memcpy(m_transferBuf.data(), &header, sizeof(header));
+            if (!sendAll(m_transferBuf.data(), size)) return false;
+            if (progress && !progress(progressOffset + length, progressOffset + length)) { abortTransfer("Cancelled"); return false; }
+        }
+        if (!finishWrite(length, rangeWrite)) return false;
+        if (calculateCrc) m_inlineCrc = ~m_inlineCrc;
+        return true;
+    }
+    std::vector<char> first(sizeof(MsgHeader) + AFM_CHUNK_SIZE), second(first.size());
+    char* buffer = first.data();
+    TransferWorker sender;
+    uint64_t sent = 0;
+    uint32_t pending = 0;
+    auto finishSend = [&] {
+        if (!sender.wait()) return false;
+        sent += pending;
+        pending = 0;
+        if (progress && !progress(progressOffset + sent, progressOffset + length)) {
+            m_lastError = "Cancelled"; return false;
+        }
+        return true;
+    };
+    while (sent + pending < length) {
+        DWORD toRead = (DWORD)std::min<uint64_t>(AFM_CHUNK_SIZE, length - sent - pending);
+        DWORD count = 0;
+        if (!ReadFile(file, buffer + sizeof(MsgHeader), toRead, &count, nullptr) || count != toRead) {
+            interruptBlocking();
+            sender.wait();
+            abortTransfer("Failed to read complete local file range"); return false;
+        }
+        if (calculateCrc) inlineCrcUpdate(buffer + sizeof(MsgHeader), count);
+        if (!finishSend()) { abortTransfer(m_lastError); return false; }
+        MsgHeader header{RSP_DATA, count};
+        memcpy(buffer, &header, sizeof(header));
+        char* sendBuffer = buffer;
+        sender.submit([this, sendBuffer, count] { return sendAll(sendBuffer, sizeof(MsgHeader) + count); });
+        pending = count;
+        buffer = buffer == first.data() ? second.data() : first.data();
+    }
+    if (!finishSend()) { abortTransfer(m_lastError); return false; }
+    if (sent != length) { abortTransfer("Incomplete upload"); return false; }
+    if (!finishWrite(length, rangeWrite)) return false;
+    if (calculateCrc) m_inlineCrc = ~m_inlineCrc;
+    return true;
+}
+
 bool DeviceClient::pushFile(const std::string& localPath, const std::string& remotePath,
                             uint64_t fileSize, ProgressCallback progress) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_connected) { m_lastError = "Not connected"; return false; }
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    // Build push header: [8B size][path]
-    std::vector<char> pushPayload(sizeof(PushHeader) + remotePath.size());
-    PushHeader ph = { fileSize };
-    memcpy(pushPayload.data(), &ph, sizeof(ph));
-    memcpy(pushPayload.data() + sizeof(ph), remotePath.data(), remotePath.size());
-
-    if (!sendMsg(CMD_PUSH, pushPayload.data(), (uint32_t)pushPayload.size())) return false;
-
-    // Wait for RSP_OK (ready to receive)
-    MsgHeader hdr; std::vector<char> payload;
-    if (!recvMsg(hdr, payload)) return false;
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(payload.data(), payload.size());
-        return false;
-    }
-    if (hdr.cmd != RSP_OK) return false;
-
-    // Open and stream local file with low I/O priority to avoid starving other apps
-    HANDLE hFile = CreateFileW(toWide(localPath).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        m_lastError = "Failed to open local file: " + localPath;
-        // Send DONE to not leave server hanging
-        sendMsg(RSP_DONE);
-        return false;
-    }
-    FILE_IO_PRIORITY_HINT_INFO priorityHint = { (PRIORITY_HINT)1 };
-    SetFileInformationByHandle(hFile, FileIoPriorityHintInfo, &priorityHint, sizeof(priorityHint));
-
-    // Triple-pipelined push: send chunk N while reading + CRC-ing chunk N+1
-    size_t pushBufSize = sizeof(MsgHeader) + AFM_CHUNK_SIZE;
-    std::vector<char> bufA(pushBufSize), bufB(pushBufSize), bufC(pushBufSize);
-    char* sendBuf = bufA.data();
-    char* readBuf = bufB.data();
-    char* spareBuf = bufC.data();
-    uint64_t sent = 0;
-    bool success = true;
-    inlineCrcReset();
-
-    // Pre-read first chunk
-    DWORD firstToRead = (DWORD)std::min((uint64_t)AFM_CHUNK_SIZE, fileSize);
-    DWORD sendBytes = 0;
-    {
-        if (!ReadFile(hFile, sendBuf + sizeof(MsgHeader), firstToRead, &sendBytes, nullptr) || sendBytes == 0) {
-            CloseHandle(hFile);
-            sendMsg(RSP_DONE);
-            recvMsg(hdr, payload);
-            return false;
-        }
-        inlineCrcUpdate(sendBuf + sizeof(MsgHeader), sendBytes);
-    }
-
-    while (sent < fileSize) {
-        MsgHeader* hdrPtr = (MsgHeader*)sendBuf;
-        hdrPtr->cmd = RSP_DATA;
-        hdrPtr->length = sendBytes;
-
-        uint64_t nextOffset = sent + sendBytes;
-        DWORD nextBytes = 0;
-        bool hasNext = nextOffset < fileSize;
-
-        // Send current chunk async
-        std::future<bool> sendFut = std::async(std::launch::async, [&, sendBuf, sendBytes]() {
-            return sendAll(sendBuf, sizeof(MsgHeader) + sendBytes);
-        });
-
-        // Read + CRC next chunk while send is in flight
-        bool readOk = true;
-        if (hasNext) {
-            DWORD toRead = (DWORD)std::min((uint64_t)AFM_CHUNK_SIZE, fileSize - nextOffset);
-            if (!ReadFile(hFile, readBuf + sizeof(MsgHeader), toRead, &nextBytes, nullptr) || nextBytes == 0) {
-                readOk = false;
-            }
-            if (readOk) inlineCrcUpdate(readBuf + sizeof(MsgHeader), nextBytes);
-        }
-
-        bool sendOk = sendFut.get();
-        if (!sendOk) { success = false; break; }
-        sent += sendBytes;
-
-        if (progress && !progress(sent, fileSize)) {
-            success = false;
-            m_lastError = "Cancelled";
-            break;
-        }
-
-        if (!hasNext || !readOk) break;
-
-        // Rotate buffers
-        char* oldSendBuf = sendBuf;
-        sendBuf = readBuf;
-        readBuf = spareBuf;
-        spareBuf = oldSendBuf;
-        sendBytes = nextBytes;
-    }
-
-    CloseHandle(hFile);
-
-    // Send DONE
-    sendMsg(RSP_DONE);
-
-    // ALWAYS read server confirmation to keep TCP stream in sync
-    // (even on cancel — otherwise the RSP_OK stays in the buffer and corrupts the next PING)
-    if (recvMsg(hdr, payload)) {
-        if (success && hdr.cmd == RSP_ERROR) {
-            m_lastError = std::string(payload.data(), payload.size());
-            return false;
-        }
-    }
-
-    if (success) {
-        m_inlineCrc = ~m_inlineCrc;
-        m_inlineCrcPath = localPath;
-    }
-
-    return success;
+    auto file = openTransferSource(localPath, 0, fileSize, m_lastError, true);
+    if (!file) return false;
+    std::vector<char> request(sizeof(PushHeader) + remotePath.size());
+    memcpy(request.data(), &fileSize, sizeof(fileSize));
+    memcpy(request.data() + sizeof(PushHeader), remotePath.data(), remotePath.size());
+    MsgHeader header{};
+    std::vector<char> response;
+    if (!sendMsg(CMD_PUSH, request.data(), (uint32_t)request.size()) || !recvMsg(header, response)) return false;
+    if (header.cmd == RSP_ERROR) { m_lastError.assign(response.begin(), response.end()); return false; }
+    if (header.cmd != RSP_OK) { abortTransfer("Invalid upload response"); return false; }
+    if (!sendFileStream(file.get(), fileSize, 0, true, false, progress)) return false;
+    m_inlineCrcPath = localPath;
+    return true;
 }
 
 bool DeviceClient::relayFile(DeviceClient& src, DeviceClient& dst,
-                              const std::string& srcPath, const std::string& dstPath,
-                              uint64_t fileSize, ProgressCallback progress) {
-    if (!src.m_connected) { src.m_lastError = "Source not connected"; return false; }
-    if (!dst.m_connected) { dst.m_lastError = "Destination not connected"; return false; }
-
-    LOG_INFO("Transfer", "relayFile START: " + srcPath + " -> " + dstPath);
-
-    // Lock both devices — always lock lower address first to prevent deadlock
-    DeviceClient* first = &src < &dst ? &src : &dst;
-    DeviceClient* second = &src < &dst ? &dst : &src;
-    std::lock_guard<std::mutex> lk1(first->m_mutex);
-    std::lock_guard<std::mutex> lk2(second->m_mutex);
-
-    // --- Initiate pull from source device ---
-    if (!src.sendMsg(CMD_PULL, srcPath.data(), (uint32_t)srcPath.size())) {
-        src.m_lastError = "Failed to send CMD_PULL";
-        return false;
-    }
-
-    MsgHeader hdr; std::vector<char> payload;
-    if (!src.recvMsg(hdr, payload)) { src.m_lastError = "No response to CMD_PULL"; return false; }
-    if (hdr.cmd == RSP_ERROR) {
-        src.m_lastError = std::string(payload.data(), payload.size());
-        return false;
-    }
-    if (hdr.cmd != RSP_OK || payload.size() < sizeof(PullHeader)) {
-        src.m_lastError = "Unexpected response to CMD_PULL";
-        return false;
-    }
-
-    PullHeader ph;
-    memcpy(&ph, payload.data(), sizeof(ph));
-    uint64_t actualSize = ph.file_size;
-    if (fileSize == 0) fileSize = actualSize;
-
-    // --- Initiate push to destination device ---
-    std::vector<char> pushPayload(sizeof(PushHeader) + dstPath.size());
-    PushHeader pushHdr = { actualSize };
-    memcpy(pushPayload.data(), &pushHdr, sizeof(pushHdr));
-    memcpy(pushPayload.data() + sizeof(pushHdr), dstPath.data(), dstPath.size());
-
-    if (!dst.sendMsg(CMD_PUSH, pushPayload.data(), (uint32_t)pushPayload.size())) {
-        dst.m_lastError = "Failed to send CMD_PUSH";
-        // Drain source pull stream before returning
-        while (src.recvAll(&hdr, sizeof(hdr))) {
-            if (hdr.cmd == RSP_DONE || hdr.cmd != RSP_DATA || hdr.length == 0) break;
-            std::vector<char> drain(hdr.length);
-            if (!src.recvAll(drain.data(), hdr.length)) break;
-        }
-        return false;
-    }
-
-    MsgHeader dstHdr; std::vector<char> dstPayload;
-    if (!dst.recvMsg(dstHdr, dstPayload) || dstHdr.cmd != RSP_OK) {
-        dst.m_lastError = dstHdr.cmd == RSP_ERROR
-            ? std::string(dstPayload.data(), dstPayload.size())
-            : "Destination rejected CMD_PUSH";
-        // Drain source
-        while (src.recvAll(&hdr, sizeof(hdr))) {
-            if (hdr.cmd == RSP_DONE || hdr.cmd != RSP_DATA || hdr.length == 0) break;
-            std::vector<char> drain(hdr.length);
-            if (!src.recvAll(drain.data(), hdr.length)) break;
-        }
-        return false;
-    }
-
-    // --- Double-buffered relay loop ---
-    // Recv from src into one buffer while async-sending previous buffer to dst
-    size_t bufSize = AFM_CHUNK_SIZE + sizeof(MsgHeader);
-    std::vector<char> bufA(bufSize), bufB(bufSize);
-    char* recvBuf = bufA.data();
-    uint64_t relayed = 0;
-    bool success = true;
-    std::future<bool> sendFut;
-
-    while (true) {
-        // Recv next chunk header from source
-        if (!src.recvAll(&hdr, sizeof(hdr))) { success = false; src.m_lastError = "recv header failed"; break; }
-
-        if (hdr.cmd == RSP_DONE) break;
-        if (hdr.cmd != RSP_DATA || hdr.length == 0) { success = false; src.m_lastError = "unexpected response in relay"; break; }
-
-        // Recv chunk data from source
-        if (!src.recvAll(recvBuf + sizeof(MsgHeader), hdr.length)) { success = false; src.m_lastError = "recv data failed"; break; }
-
-        // Wait for previous send to complete before reusing the other buffer
-        if (sendFut.valid()) {
-            if (!sendFut.get()) { success = false; dst.m_lastError = "send to dst failed"; break; }
-        }
-
-        // Prepare MsgHeader for forwarding
-        MsgHeader* fwdHdr = (MsgHeader*)recvBuf;
-        fwdHdr->cmd = RSP_DATA;
-        fwdHdr->length = hdr.length;
-
-        // Async send to destination
-        char* sendBuf = recvBuf;
-        uint32_t sendLen = sizeof(MsgHeader) + hdr.length;
-        sendFut = std::async(std::launch::async, [&dst, sendBuf, sendLen]() {
-            return dst.sendAll(sendBuf, sendLen);
-        });
-
-        relayed += hdr.length;
-
-        // Progress callback
-        if (progress && !progress(relayed, fileSize)) {
-            success = false;
-            src.m_lastError = "Cancelled";
-            break;
-        }
-
-        // Swap buffers
-        recvBuf = (recvBuf == bufA.data()) ? bufB.data() : bufA.data();
-    }
-
-    // Wait for last send
-    if (sendFut.valid()) {
-        if (!sendFut.get()) { success = false; dst.m_lastError = "send to dst failed"; }
-    }
-
-    // Send RSP_DONE to destination
-    dst.sendMsg(RSP_DONE);
-
-    // Read destination confirmation
-    if (dst.recvMsg(dstHdr, dstPayload)) {
-        if (success && dstHdr.cmd == RSP_ERROR) {
-            dst.m_lastError = std::string(dstPayload.data(), dstPayload.size());
-            success = false;
-        }
-    }
-
-    // If we broke out early (cancel/error), drain remaining source data
-    if (!success && src.m_connected) {
-        while (src.recvAll(&hdr, sizeof(hdr))) {
-            if (hdr.cmd == RSP_DONE) break;
-            if (hdr.cmd != RSP_DATA || hdr.length == 0) break;
-            std::vector<char> drain(hdr.length);
-            if (!src.recvAll(drain.data(), hdr.length)) break;
-        }
-    }
-
-    if (success) {
-        LOG_INFO("Transfer", "relayFile OK: " + std::to_string(relayed) + " bytes relayed");
-    } else {
-        LOG_ERROR("Transfer", "relayFile FAILED: src=" + src.m_lastError + " dst=" + dst.m_lastError);
-    }
-    return success;
+                             const std::string& srcPath, const std::string& dstPath,
+                             uint64_t fileSize, ProgressCallback progress) {
+    return relayStream(src, dst, srcPath, dstPath, 0, 0, fileSize, false, progress, nullptr);
 }
 
 bool DeviceClient::relayRange(DeviceClient& src, DeviceClient& dst,
                               const std::string& srcPath, const std::string& dstPath,
                               uint64_t srcOffset, uint64_t dstOffset, uint64_t length,
-                              ProgressCallback progress,
-                              RelayRangeStats* stats) {
-    if (!src.m_connected) { src.m_lastError = "Source not connected"; return false; }
-    if (!dst.m_connected) { dst.m_lastError = "Destination not connected"; return false; }
-    if (length == 0) return true;
+                              ProgressCallback progress, RelayRangeStats* stats) {
+    return relayStream(src, dst, srcPath, dstPath, srcOffset, dstOffset, length, true, progress, stats);
+}
 
-    DeviceClient* first = &src < &dst ? &src : &dst;
-    DeviceClient* second = &src < &dst ? &dst : &src;
-    std::lock_guard<std::mutex> lk1(first->m_mutex);
-    std::lock_guard<std::mutex> lk2(second->m_mutex);
-
-    std::vector<char> readPayload(16 + srcPath.size());
-    memcpy(readPayload.data(), &srcOffset, 8);
-    memcpy(readPayload.data() + 8, &length, 8);
-    memcpy(readPayload.data() + 16, srcPath.data(), srcPath.size());
-
-    if (!src.sendMsg(CMD_READ_RANGE, readPayload.data(), (uint32_t)readPayload.size())) {
-        src.m_lastError = "Failed to send CMD_READ_RANGE";
-        return false;
+bool DeviceClient::relayStream(DeviceClient& src, DeviceClient& dst,
+                               const std::string& srcPath, const std::string& dstPath,
+                               uint64_t srcOffset, uint64_t dstOffset, uint64_t length,
+                               bool range, ProgressCallback progress, RelayRangeStats* stats) {
+    if (&src == &dst) { src.m_lastError = "Relay requires separate connections"; return false; }
+    std::scoped_lock lock(src.m_mutex, dst.m_mutex);
+    if (!src.m_connected || !dst.m_connected) { src.m_lastError = "Relay device not connected"; return false; }
+    if (range && (srcOffset > INT64_MAX || length > INT64_MAX - srcOffset ||
+        dstOffset > INT64_MAX || length > INT64_MAX - dstOffset)) {
+        src.m_lastError = "Invalid relay range bounds"; return false;
     }
-
-    MsgHeader srcHdr; std::vector<char> srcResp;
-    if (!src.recvMsg(srcHdr, srcResp)) { src.m_lastError = "No response to CMD_READ_RANGE"; return false; }
-    if (srcHdr.cmd == RSP_ERROR) {
-        src.m_lastError = std::string(srcResp.data(), srcResp.size());
-        return false;
+    if (range && length == 0) return true;
+    std::vector<char> request((range ? 16 : 0) + srcPath.size());
+    if (range) { memcpy(request.data(), &srcOffset, 8); memcpy(request.data() + 8, &length, 8); }
+    memcpy(request.data() + (range ? 16 : 0), srcPath.data(), srcPath.size());
+    MsgHeader header{};
+    std::vector<char> response;
+    if (!src.sendMsg(range ? CMD_READ_RANGE : CMD_PULL, request.data(), (uint32_t)request.size()) ||
+        !src.recvMsg(header, response)) return false;
+    if (header.cmd == RSP_ERROR) { src.m_lastError.assign(response.begin(), response.end()); return false; }
+    if (header.cmd != RSP_OK || response.size() != 8) { src.abortTransfer("Invalid relay response"); return false; }
+    uint64_t actualSize = 0;
+    memcpy(&actualSize, response.data(), 8);
+    if (actualSize > INT64_MAX) { src.abortTransfer("Invalid relay file size"); return false; }
+    if (range && actualSize != length) { src.abortTransfer("Source range changed during relay"); return false; }
+    request.resize((range ? 16 : 8) + dstPath.size());
+    if (range) { memcpy(request.data(), &dstOffset, 8); memcpy(request.data() + 8, &actualSize, 8); }
+    else memcpy(request.data(), &actualSize, 8);
+    memcpy(request.data() + (range ? 16 : 8), dstPath.data(), dstPath.size());
+    if (!dst.sendMsg(range ? CMD_WRITE_RANGE : CMD_PUSH, request.data(), (uint32_t)request.size()) ||
+        !dst.recvMsg(header, response) || header.cmd != RSP_OK) {
+        if (header.cmd == RSP_ERROR) dst.m_lastError.assign(response.begin(), response.end());
+        src.abortTransfer("Destination rejected relay"); return false;
     }
-    if (srcHdr.cmd != RSP_OK || srcResp.size() < 8) {
-        src.m_lastError = "Unexpected response to CMD_READ_RANGE";
-        return false;
-    }
-
-    uint64_t actualLen = 0;
-    memcpy(&actualLen, srcResp.data(), 8);
-    actualLen = std::min(actualLen, length);
-    if (actualLen == 0) return true;
-
-    std::vector<char> writePayload(16 + dstPath.size());
-    memcpy(writePayload.data(), &dstOffset, 8);
-    memcpy(writePayload.data() + 8, &actualLen, 8);
-    memcpy(writePayload.data() + 16, dstPath.data(), dstPath.size());
-
-    if (!dst.sendMsg(CMD_WRITE_RANGE, writePayload.data(), (uint32_t)writePayload.size())) {
-        dst.m_lastError = "Failed to send CMD_WRITE_RANGE";
-        while (src.recvAll(&srcHdr, sizeof(srcHdr))) {
-            if (srcHdr.cmd == RSP_DONE) break;
-            if (srcHdr.cmd != RSP_DATA || srcHdr.length == 0) break;
-            std::vector<char> drain(srcHdr.length);
-            if (!src.recvAll(drain.data(), srcHdr.length)) break;
-        }
-        return false;
-    }
-
-    MsgHeader dstHdr; std::vector<char> dstResp;
-    if (!dst.recvMsg(dstHdr, dstResp)) {
-        dst.m_lastError = "No response to CMD_WRITE_RANGE";
-        return false;
-    }
-    if (dstHdr.cmd == RSP_ERROR) {
-        dst.m_lastError = std::string(dstResp.data(), dstResp.size());
-        return false;
-    }
-    if (dstHdr.cmd != RSP_OK) {
-        dst.m_lastError = "Destination rejected CMD_WRITE_RANGE";
-        return false;
-    }
-
-    const size_t bufSize = AFM_CHUNK_SIZE + sizeof(MsgHeader);
-    std::vector<char> bufA(bufSize), bufB(bufSize);
-    char* recvBuf = bufA.data();
-    std::future<std::pair<bool, double>> sendFut;
-    uint32_t inFlightLen = 0;
-    bool success = true;
-    uint64_t relayed = 0;
-    uint64_t sentToDst = 0;
-    uint32_t srcRangeCrc = ~(uint32_t)0;
-
-    auto finishSend = [&]() -> bool {
-        if (!sendFut.valid()) return true;
-        auto result = sendFut.get();
-        if (stats) stats->dstSendSec += result.second;
-        if (!result.first) {
-            dst.m_lastError = "send range data failed";
-            return false;
-        }
-        sentToDst += inFlightLen;
-        if (progress && !progress(sentToDst, actualLen)) {
-            src.m_lastError = "Cancelled";
-            return false;
-        }
-        inFlightLen = 0;
+    size_t bufferSize = sizeof(MsgHeader) + (size_t)std::min<uint64_t>(actualSize, AFM_CHUNK_SIZE);
+    std::vector<char> first(bufferSize), second(actualSize > AFM_CHUNK_SIZE ? bufferSize : 0);
+    char* buffer = first.data();
+    std::unique_ptr<TransferWorker> sender;
+    if (actualSize > AFM_CHUNK_SIZE) sender = std::make_unique<TransferWorker>();
+    uint64_t received = 0, sent = 0;
+    uint32_t pending = 0, crc = ~(uint32_t)0;
+    bool complete = false;
+    auto finishSend = [&] {
+        if (sender && !sender->wait()) return false;
+        sent += pending;
+        pending = 0;
+        if (progress && !progress(sent, actualSize)) { src.m_lastError = "Cancelled"; return false; }
         return true;
     };
-
-    while (success) {
-        auto recvStart = std::chrono::steady_clock::now();
-        if (!src.recvAll(&srcHdr, sizeof(srcHdr))) {
-            success = false;
-            src.m_lastError = "recv range header failed";
+    while (true) {
+        auto start = std::chrono::steady_clock::now();
+        if (!src.recvAll(&header, sizeof(header))) break;
+        if (header.cmd == RSP_DONE) {
+            complete = header.length == 0 && received == actualSize;
+            if (!complete) src.m_lastError = "Incomplete relay response";
             break;
         }
-
-        if (srcHdr.cmd == RSP_DONE) break;
-        if (srcHdr.cmd != RSP_DATA || srcHdr.length == 0 || srcHdr.length > AFM_CHUNK_SIZE) {
-            success = false;
-            src.m_lastError = "unexpected response in range relay";
-            break;
-        }
-
-        if (!src.recvAll(recvBuf + sizeof(MsgHeader), srcHdr.length)) {
-            success = false;
-            src.m_lastError = "recv range data failed";
-            break;
-        }
-        if (stats) {
-            stats->srcRecvSec += std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - recvStart).count();
-        }
-        crc32Update(srcRangeCrc, recvBuf + sizeof(MsgHeader), srcHdr.length);
-
-        if (!finishSend()) {
-            success = false;
-            break;
-        }
-
-        MsgHeader* fwdHdr = (MsgHeader*)recvBuf;
-        fwdHdr->cmd = RSP_DATA;
-        fwdHdr->length = srcHdr.length;
-        relayed += srcHdr.length;
-
-        char* sendBuf = recvBuf;
-        uint32_t sendLen = sizeof(MsgHeader) + srcHdr.length;
-        inFlightLen = srcHdr.length;
-        sendFut = std::async(std::launch::async, [&dst, sendBuf, sendLen]() {
-            auto sendStart = std::chrono::steady_clock::now();
-            bool ok = dst.sendAll(sendBuf, sendLen);
-            double sendSec = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - sendStart).count();
-            return std::make_pair(ok, sendSec);
-        });
-        recvBuf = (recvBuf == bufA.data()) ? bufB.data() : bufA.data();
+        if (header.cmd != RSP_DATA || header.length == 0 || header.length > AFM_CHUNK_SIZE ||
+            header.length > actualSize - received) { src.m_lastError = "Invalid relay data length"; break; }
+        if (!src.recvAll(buffer + sizeof(MsgHeader), header.length)) break;
+        if (stats) stats->srcRecvSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (stats) crc32Update(crc, buffer + sizeof(MsgHeader), header.length);
+        if (!finishSend()) break;
+        memcpy(buffer, &header, sizeof(header));
+        char* sendBuffer = buffer;
+        uint32_t count = header.length;
+        auto sendChunk = [&dst, sendBuffer, count, stats] {
+            auto start = std::chrono::steady_clock::now();
+            bool ok = dst.sendAll(sendBuffer, sizeof(MsgHeader) + count);
+            if (stats) stats->dstSendSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            return ok;
+        };
+        if (sender) sender->submit(sendChunk);
+        else if (!sendChunk()) break;
+        pending = count;
+        received += count;
+        if (sender) buffer = buffer == first.data() ? second.data() : first.data();
     }
-
-    if (!finishSend())
-        success = false;
-
-    dst.sendMsg(RSP_DONE);
-
-    if (dst.recvMsg(dstHdr, dstResp)) {
-        if (success && dstHdr.cmd == RSP_ERROR) {
-            dst.m_lastError = std::string(dstResp.data(), dstResp.size());
-            success = false;
-        } else if (success && dstHdr.cmd == RSP_OK && dstResp.size() >= 12 && stats) {
-            uint64_t dstWritten = 0;
-            uint32_t dstCrc = 0;
-            memcpy(&dstWritten, dstResp.data(), 8);
-            memcpy(&dstCrc, dstResp.data() + 8, 4);
-            if (dstWritten >= actualLen) {
-                stats->dstCrc = dstCrc;
-                stats->hasDstCrc = true;
-            }
-        }
-    } else if (success) {
-        dst.m_lastError = "No write confirmation";
-        success = false;
+    if (!complete) {
+        src.abortTransfer(src.m_lastError.empty() ? "Relay interrupted" : src.m_lastError);
+        dst.interruptBlocking();
     }
-
-    if (!success && src.m_connected) {
-        while (src.recvAll(&srcHdr, sizeof(srcHdr))) {
-            if (srcHdr.cmd == RSP_DONE) break;
-            if (srcHdr.cmd != RSP_DATA || srcHdr.length == 0) break;
-            std::vector<char> drain(srcHdr.length);
-            if (!src.recvAll(drain.data(), srcHdr.length)) break;
-        }
+    if (!finishSend()) complete = false;
+    if (!complete || sent != actualSize) {
+        src.abortTransfer(src.m_lastError.empty() ? "Relay interrupted" : src.m_lastError);
+        dst.abortTransfer(dst.m_lastError.empty() ? "Relay interrupted" : dst.m_lastError);
+        return false;
     }
-
+    uint32_t destinationCrc = 0;
+    if (!dst.finishWrite(actualSize, range, range && stats ? &destinationCrc : nullptr)) return false;
     if (stats) {
-        stats->bytes += sentToDst;
-        if (success && sentToDst >= actualLen && relayed >= actualLen) {
-            stats->srcCrc = ~srcRangeCrc;
-            stats->hasSrcCrc = true;
-        }
+        stats->bytes += sent;
+        stats->srcCrc = ~crc;
+        stats->hasSrcCrc = true;
+        stats->dstCrc = destinationCrc;
+        stats->hasDstCrc = range;
     }
-
-    return success && sentToDst >= actualLen && relayed >= actualLen;
+    return true;
 }
 
 bool DeviceClient::getDiskSpace(uint64_t& totalBytes, uint64_t& freeBytes) {
@@ -3207,6 +2888,9 @@ bool DeviceClient::getDiskSpace(uint64_t& totalBytes, uint64_t& freeBytes) {
 uint64_t DeviceClient::writeRange(const std::string& remotePath, uint64_t offset,
                                    const void* data, uint32_t length) {
     if (!m_connected) { m_lastError = "Not connected"; return 0; }
+    if ((!data && length) || offset > INT64_MAX || length > INT64_MAX - offset) {
+        m_lastError = "Invalid range bounds"; return 0;
+    }
     std::lock_guard<std::mutex> lk(m_mutex);
 
     // Build payload: [8B offset][8B length][path]
@@ -3239,136 +2923,29 @@ uint64_t DeviceClient::writeRange(const std::string& remotePath, uint64_t offset
         sent += chunkLen;
     }
 
-    // Send RSP_DONE
-    if (!sendMsg(RSP_DONE)) return 0;
-
-    // Receive confirmation with bytes written
-    if (!recvMsg(hdr, resp)) return 0;
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(resp.data(), resp.size());
-        return 0;
-    }
-    if (hdr.cmd != RSP_OK || resp.size() < 8) return 0;
-
-    uint64_t written;
-    memcpy(&written, resp.data(), 8);
-    return written;
+    return finishWrite(len64, true) ? len64 : 0;
 }
 
 uint64_t DeviceClient::writeRangeStreaming(const std::string& remotePath, uint64_t remoteOffset,
                                            const std::string& localPath, uint64_t localOffset,
                                            uint64_t length, ProgressCallback progress) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_connected) { m_lastError = "Not connected"; return 0; }
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    // Open local file
-    HANDLE hFile = CreateFileW(toWide(localPath).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        m_lastError = "Failed to open local file: " + localPath;
-        return 0;
+    if (remoteOffset > INT64_MAX || length > INT64_MAX - remoteOffset) {
+        m_lastError = "Invalid range bounds"; return 0;
     }
-
-    // Seek to localOffset
-    LARGE_INTEGER seekPos; seekPos.QuadPart = (LONGLONG)localOffset;
-    SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN);
-
-    // Build payload: [8B offset][8B length][path]
-    std::vector<char> cmdPayload(16 + remotePath.size());
-    memcpy(cmdPayload.data(), &remoteOffset, 8);
-    memcpy(cmdPayload.data() + 8, &length, 8);
-    memcpy(cmdPayload.data() + 16, remotePath.data(), remotePath.size());
-
-    if (!sendMsg(CMD_WRITE_RANGE, cmdPayload.data(), (uint32_t)cmdPayload.size())) {
-        CloseHandle(hFile);
-        return 0;
-    }
-
-    // Wait for RSP_OK (server opened file, seeked to offset)
-    MsgHeader hdr; std::vector<char> resp;
-    if (!recvMsg(hdr, resp)) { CloseHandle(hFile); return 0; }
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(resp.data(), resp.size());
-        CloseHandle(hFile);
-        return 0;
-    }
-    if (hdr.cmd != RSP_OK) { CloseHandle(hFile); return 0; }
-
-    // Triple-pipelined streaming: send chunk N while reading chunk N+1
-    size_t pushBufSize = sizeof(MsgHeader) + AFM_CHUNK_SIZE;
-    std::vector<char> bufA(pushBufSize), bufB(pushBufSize), bufC(pushBufSize);
-    char* sendBuf = bufA.data();
-    char* readBuf = bufB.data();
-    char* spareBuf = bufC.data();
-    uint64_t sent = 0;
-    bool success = true;
-
-    // Pre-read first chunk
-    DWORD firstToRead = (DWORD)std::min((uint64_t)AFM_CHUNK_SIZE, length);
-    DWORD sendBytes = 0;
-    if (!ReadFile(hFile, sendBuf + sizeof(MsgHeader), firstToRead, &sendBytes, nullptr) || sendBytes == 0) {
-        CloseHandle(hFile);
-        sendMsg(RSP_DONE);
-        recvMsg(hdr, resp);
-        return 0;
-    }
-
-    while (sent < length) {
-        MsgHeader* hdrPtr = (MsgHeader*)sendBuf;
-        hdrPtr->cmd = RSP_DATA;
-        hdrPtr->length = sendBytes;
-
-        uint64_t nextOffset = sent + sendBytes;
-        DWORD nextBytes = 0;
-        bool hasNext = nextOffset < length;
-
-        // Send current chunk async
-        std::future<bool> sendFut = std::async(std::launch::async, [&, sendBuf, sendBytes]() {
-            return sendAll(sendBuf, sizeof(MsgHeader) + sendBytes);
-        });
-
-        // Read next chunk while send is in flight
-        bool readOk = true;
-        if (hasNext) {
-            DWORD toRead = (DWORD)std::min((uint64_t)AFM_CHUNK_SIZE, length - nextOffset);
-            if (!ReadFile(hFile, readBuf + sizeof(MsgHeader), toRead, &nextBytes, nullptr) || nextBytes == 0)
-                readOk = false;
-        }
-
-        bool sendOk = sendFut.get();
-        if (!sendOk) { success = false; break; }
-        sent += sendBytes;
-
-        if (progress && !progress(sent, length)) {
-            success = false;
-            m_lastError = "Cancelled";
-            break;
-        }
-
-        if (!hasNext || !readOk) break;
-
-        // Rotate buffers
-        char* oldSendBuf = sendBuf;
-        sendBuf = readBuf;
-        readBuf = spareBuf;
-        spareBuf = oldSendBuf;
-        sendBytes = nextBytes;
-    }
-
-    CloseHandle(hFile);
-
-    // Send DONE
-    sendMsg(RSP_DONE);
-
-    // Always read server confirmation to keep TCP stream in sync
-    if (recvMsg(hdr, resp)) {
-        if (success && hdr.cmd == RSP_ERROR) {
-            m_lastError = std::string(resp.data(), resp.size());
-            return 0;
-        }
-    }
-
-    return success ? sent : 0;
+    auto file = openTransferSource(localPath, localOffset, length, m_lastError);
+    if (!file) return 0;
+    std::vector<char> request(16 + remotePath.size());
+    memcpy(request.data(), &remoteOffset, 8);
+    memcpy(request.data() + 8, &length, 8);
+    memcpy(request.data() + 16, remotePath.data(), remotePath.size());
+    MsgHeader header{};
+    std::vector<char> response;
+    if (!sendMsg(CMD_WRITE_RANGE, request.data(), (uint32_t)request.size()) || !recvMsg(header, response)) return 0;
+    if (header.cmd == RSP_ERROR) { m_lastError.assign(response.begin(), response.end()); return 0; }
+    if (header.cmd != RSP_OK) { abortTransfer("Invalid range write response"); return 0; }
+    return sendFileStream(file.get(), length, 0, false, true, progress) ? length : 0;
 }
 
 bool DeviceClient::createFile(const std::string& remotePath, uint64_t totalSize) {
@@ -3390,262 +2967,111 @@ bool DeviceClient::createFile(const std::string& remotePath, uint64_t totalSize)
     return hdr.cmd == RSP_OK;
 }
 
+bool DeviceClient::truncateFile(const std::string& remotePath, uint64_t totalSize) {
+    if (!m_connected) { m_lastError = "Not connected"; return false; }
+    if (totalSize > INT64_MAX) { m_lastError = "Invalid file size"; return false; }
+    std::vector<char> request(8 + remotePath.size());
+    memcpy(request.data(), &totalSize, 8);
+    memcpy(request.data() + 8, remotePath.data(), remotePath.size());
+    MsgHeader header{};
+    std::vector<char> response;
+    if (!runSmallOp(CMD_TRUNCATE_FILE, request.data(), (uint32_t)request.size(), header, response)) return false;
+    if (header.cmd == RSP_ERROR) { m_lastError.assign(response.begin(), response.end()); return false; }
+    if (header.cmd != RSP_OK || !response.empty()) { m_lastError = "Invalid truncate response"; return false; }
+    return true;
+}
+
 uint64_t DeviceClient::readRange(const std::string& remotePath, uint64_t offset, uint64_t length,
                                  void* outBuffer) {
-    if (!m_connected) { m_lastError = "Not connected"; return 0; }
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    // Build payload: [8B offset][8B length][path]
-    std::vector<char> payload(16 + remotePath.size());
-    memcpy(payload.data(), &offset, 8);
-    memcpy(payload.data() + 8, &length, 8);
-    memcpy(payload.data() + 16, remotePath.data(), remotePath.size());
-
-    if (!sendMsg(CMD_READ_RANGE, payload.data(), (uint32_t)payload.size())) return 0;
-
-    MsgHeader hdr; std::vector<char> resp;
-    if (!recvMsg(hdr, resp)) return 0;
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(resp.data(), resp.size());
-        return 0;
-    }
-    if (hdr.cmd != RSP_OK || resp.size() < 8) return 0;
-
-    uint64_t actualLen;
-    memcpy(&actualLen, resp.data(), 8);
-
-    // Receive data chunks into outBuffer
-    uint64_t received = 0;
-    char* dst = (char*)outBuffer;
-
-    while (true) {
-        if (!recvAll(&hdr, sizeof(hdr))) break;
-        if (hdr.cmd == RSP_DONE) break;
-        if (hdr.cmd != RSP_DATA || hdr.length == 0) break;
-
-        if (received + hdr.length <= actualLen) {
-            if (!recvAll(dst + received, hdr.length)) break;
-        } else {
-            // Overflow safety — recv into transfer buf and copy what fits
-            if (m_transferBuf.size() < hdr.length) m_transferBuf.resize(hdr.length);
-            if (!recvAll(m_transferBuf.data(), hdr.length)) break;
-            uint64_t toCopy = actualLen - received;
-            if (toCopy > 0) memcpy(dst + received, m_transferBuf.data(), (size_t)toCopy);
-        }
-        received += hdr.length;
-    }
-
-    return std::min(received, actualLen);
+    if (!outBuffer && length) { m_lastError = "Missing range buffer"; return 0; }
+    return readRangeStreaming(remotePath, offset, length,
+        [outBuffer, offset](const void* data, uint32_t count, uint64_t position) {
+            memcpy((char*)outBuffer + (size_t)(position - offset), data, count);
+            return true;
+        });
 }
 
 uint64_t DeviceClient::readRangeStreaming(const std::string& remotePath, uint64_t offset, uint64_t length,
-                                           ReadRangeCallback chunkCallback) {
+                                           ReadRangeCallback callback) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_connected) { m_lastError = "Not connected"; return 0; }
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    // Build payload: [8B offset][8B length][path]
-    std::vector<char> payload(16 + remotePath.size());
-    memcpy(payload.data(), &offset, 8);
-    memcpy(payload.data() + 8, &length, 8);
-    memcpy(payload.data() + 16, remotePath.data(), remotePath.size());
-
-    if (!sendMsg(CMD_READ_RANGE, payload.data(), (uint32_t)payload.size())) return 0;
-
-    MsgHeader hdr; std::vector<char> resp;
-    if (!recvMsg(hdr, resp)) return 0;
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(resp.data(), resp.size());
-        return 0;
-    }
-    if (hdr.cmd != RSP_OK || resp.size() < 8) return 0;
-
-    uint64_t actualLen;
-    memcpy(&actualLen, resp.data(), 8);
-
-    // Stream chunks to callback
-    uint64_t received = 0;
+    if (length > UINT64_MAX - offset) { m_lastError = "Invalid range bounds"; return 0; }
+    std::vector<char> request(16 + remotePath.size());
+    memcpy(request.data(), &offset, 8);
+    memcpy(request.data() + 8, &length, 8);
+    memcpy(request.data() + 16, remotePath.data(), remotePath.size());
+    MsgHeader header{};
+    std::vector<char> response;
+    if (!sendMsg(CMD_READ_RANGE, request.data(), (uint32_t)request.size()) || !recvMsg(header, response)) return 0;
+    if (header.cmd == RSP_ERROR) { m_lastError.assign(response.begin(), response.end()); return 0; }
+    if (header.cmd != RSP_OK || response.size() != 8) { abortTransfer("Invalid range response"); return 0; }
+    uint64_t actual = 0;
+    memcpy(&actual, response.data(), 8);
+    if (actual > length) { abortTransfer("Range response exceeds requested length"); return 0; }
     if (m_transferBuf.size() < AFM_CHUNK_SIZE) m_transferBuf.resize(AFM_CHUNK_SIZE);
-
+    uint64_t received = 0;
     while (true) {
-        if (!recvAll(&hdr, sizeof(hdr))) break;
-        if (hdr.cmd == RSP_DONE) break;
-        if (hdr.cmd != RSP_DATA || hdr.length == 0) break;
-
-        if (m_transferBuf.size() < hdr.length) m_transferBuf.resize(hdr.length);
-        if (!recvAll(m_transferBuf.data(), hdr.length)) break;
-
-        if (!chunkCallback(m_transferBuf.data(), hdr.length, offset + received)) {
-            // Callback aborted — drain remaining data
-            while (recvAll(&hdr, sizeof(hdr))) {
-                if (hdr.cmd == RSP_DONE) break;
-                if (hdr.cmd != RSP_DATA || hdr.length == 0) break;
-                if (m_transferBuf.size() < hdr.length) m_transferBuf.resize(hdr.length);
-                if (!recvAll(m_transferBuf.data(), hdr.length)) break;
-            }
-            break;
+        if (!recvAll(&header, sizeof(header))) return 0;
+        if (header.cmd == RSP_DONE) {
+            if (header.length == 0 && received == actual) return received;
+            abortTransfer("Incomplete range response"); return 0;
         }
-        received += hdr.length;
+        if (header.cmd != RSP_DATA || header.length == 0 || header.length > AFM_CHUNK_SIZE ||
+            header.length > actual - received) { abortTransfer("Invalid range data length"); return 0; }
+        if (!recvAll(m_transferBuf.data(), header.length)) return 0;
+        if (!callback(m_transferBuf.data(), header.length, offset + received)) {
+            abortTransfer("Cancelled"); return 0;
+        }
+        received += header.length;
     }
-
-    return std::min(received, actualLen);
 }
 
 bool DeviceClient::resumePullFile(const std::string& remotePath, const std::string& localPath,
                                   uint64_t& outFileSize, ProgressCallback progress) {
-    // Check how much we already have locally
-    uint64_t localSize = 0;
-    try {
-        if (std::filesystem::exists(toFsPath(localPath)))
-            localSize = std::filesystem::file_size(toFsPath(localPath));
-    } catch (...) {}
-
-    if (localSize == 0) {
-        // No partial file - just do a normal pull
-        return pullFile(remotePath, localPath, outFileSize, progress);
+    std::error_code error;
+    uint64_t offset = std::filesystem::file_size(toFsPath(localPath), error);
+    if (error || offset == 0) return pullFile(remotePath, localPath, outFileSize, progress);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_connected) { m_lastError = "Not connected"; return false; }
+    m_inlineCrcPath.clear();
+    std::vector<char> request(8 + remotePath.size());
+    memcpy(request.data(), &offset, 8);
+    memcpy(request.data() + 8, remotePath.data(), remotePath.size());
+    MsgHeader header{};
+    std::vector<char> response;
+    if (!sendMsg(CMD_RESUME_PULL, request.data(), (uint32_t)request.size()) || !recvMsg(header, response)) return false;
+    if (header.cmd == RSP_ERROR) { m_lastError.assign(response.begin(), response.end()); return false; }
+    if (header.cmd != RSP_OK || response.size() != sizeof(PullHeader)) {
+        abortTransfer("Invalid resume response"); return false;
     }
-
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    // Build payload: [8B offset][path]
-    std::vector<char> payload(8 + remotePath.size());
-    memcpy(payload.data(), &localSize, 8);
-    memcpy(payload.data() + 8, remotePath.data(), remotePath.size());
-
-    if (!sendMsg(CMD_RESUME_PULL, payload.data(), (uint32_t)payload.size())) return false;
-
-    MsgHeader hdr; std::vector<char> resp;
-    if (!recvMsg(hdr, resp)) return false;
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(resp.data(), resp.size());
-        return false;
-    }
-    if (hdr.cmd != RSP_OK || resp.size() < sizeof(PullHeader)) return false;
-
-    PullHeader ph;
-    memcpy(&ph, resp.data(), sizeof(ph));
-    outFileSize = ph.file_size;
-
-    // Open local file in append mode
-    HANDLE hFile = CreateFileW(toWide(localPath).c_str(), GENERIC_WRITE, 0, nullptr,
-                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        m_lastError = "Failed to open local file: " + localPath;
-        return false;
-    }
-
-    // Seek to end (append)
-    LARGE_INTEGER li; li.QuadPart = (LONGLONG)localSize;
-    SetFilePointerEx(hFile, li, nullptr, FILE_BEGIN);
-
-    uint64_t received = localSize;
-    bool success = true;
-
-    while (true) {
-        if (!recvAll(&hdr, sizeof(hdr))) { success = false; break; }
-        if (hdr.cmd == RSP_DONE) break;
-        if (hdr.cmd != RSP_DATA || hdr.length == 0) { success = false; break; }
-
-        if (m_transferBuf.size() < hdr.length) m_transferBuf.resize(hdr.length);
-        if (!recvAll(m_transferBuf.data(), hdr.length)) { success = false; break; }
-
-        DWORD written;
-        WriteFile(hFile, m_transferBuf.data(), hdr.length, &written, nullptr);
-        received += written;
-
-        if (progress && !progress(received, outFileSize)) {
-            success = false; m_lastError = "Cancelled"; break;
-        }
-    }
-
-    CloseHandle(hFile);
-
-    // Always drain until RSP_DONE to keep stream clean
-    if (m_connected) {
-        while (recvAll(&hdr, sizeof(hdr))) {
-            if (hdr.cmd == RSP_DONE) break;
-            if (hdr.cmd != RSP_DATA || hdr.length == 0) break;
-            if (m_transferBuf.size() < hdr.length) m_transferBuf.resize(hdr.length);
-            if (!recvAll(m_transferBuf.data(), hdr.length)) break;
-        }
-    }
-
-    return success;
+    memcpy(&outFileSize, response.data(), 8);
+    return receiveFileStream(localPath, outFileSize, offset, false, progress);
 }
 
 bool DeviceClient::resumePushFile(const std::string& localPath, const std::string& remotePath,
                                   uint64_t fileSize, ProgressCallback progress) {
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    // Build payload: [8B total_size][path]
-    std::vector<char> payload(8 + remotePath.size());
-    memcpy(payload.data(), &fileSize, 8);
-    memcpy(payload.data() + 8, remotePath.data(), remotePath.size());
-
-    if (!sendMsg(CMD_RESUME_PUSH, payload.data(), (uint32_t)payload.size())) return false;
-
-    // Server responds with RSP_OK + [8B offset] = how much it already has
-    MsgHeader hdr; std::vector<char> resp;
-    if (!recvMsg(hdr, resp)) return false;
-    if (hdr.cmd == RSP_ERROR) {
-        m_lastError = std::string(resp.data(), resp.size());
-        return false;
-    }
-    if (hdr.cmd != RSP_OK || resp.size() < 8) return false;
-
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_connected) { m_lastError = "Not connected"; return false; }
+    auto file = openTransferSource(localPath, 0, fileSize, m_lastError, true);
+    if (!file) return false;
+    m_inlineCrcPath.clear();
+    std::vector<char> request(8 + remotePath.size());
+    memcpy(request.data(), &fileSize, 8);
+    memcpy(request.data() + 8, remotePath.data(), remotePath.size());
+    MsgHeader header{};
+    std::vector<char> response;
+    if (!sendMsg(CMD_RESUME_PUSH, request.data(), (uint32_t)request.size()) || !recvMsg(header, response)) return false;
+    if (header.cmd == RSP_ERROR) { m_lastError.assign(response.begin(), response.end()); return false; }
+    if (header.cmd != RSP_OK || response.size() != 8) { abortTransfer("Invalid resume response"); return false; }
     uint64_t offset = 0;
-    memcpy(&offset, resp.data(), 8);
-
-    // Open local file and seek to offset — low I/O priority to avoid starving other apps
-    HANDLE hFile = CreateFileW(toWide(localPath).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        m_lastError = "Failed to open local file: " + localPath;
-        sendMsg(RSP_DONE);
-        return false;
+    memcpy(&offset, response.data(), 8);
+    if (offset > fileSize) { abortTransfer("Invalid resume offset"); return false; }
+    LARGE_INTEGER position{};
+    position.QuadPart = (LONGLONG)offset;
+    if (!SetFilePointerEx(file.get(), position, nullptr, FILE_BEGIN)) {
+        abortTransfer("Failed to seek resume source"); return false;
     }
-    { FILE_IO_PRIORITY_HINT_INFO ph = { (PRIORITY_HINT)1 }; SetFileInformationByHandle(hFile, FileIoPriorityHintInfo, &ph, sizeof(ph)); }
-
-    if (offset > 0) {
-        LARGE_INTEGER li; li.QuadPart = (LONGLONG)offset;
-        SetFilePointerEx(hFile, li, nullptr, FILE_BEGIN);
-    }
-
-    // Stream from offset — reuse transfer buffer
-    size_t pushBufSize = sizeof(MsgHeader) + AFM_CHUNK_SIZE;
-    if (m_transferBuf.size() < pushBufSize) m_transferBuf.resize(pushBufSize);
-    char* buf = m_transferBuf.data();
-    uint64_t sent = offset;
-    bool success = true;
-
-    while (sent < fileSize) {
-        DWORD toRead = (DWORD)std::min((uint64_t)AFM_CHUNK_SIZE, fileSize - sent);
-        DWORD bytesRead;
-        if (!ReadFile(hFile, buf + sizeof(MsgHeader), toRead, &bytesRead, nullptr) || bytesRead == 0) break;
-
-        MsgHeader* hdrPtr = (MsgHeader*)buf;
-        hdrPtr->cmd = RSP_DATA;
-        hdrPtr->length = bytesRead;
-        if (!sendAll(buf, sizeof(MsgHeader) + bytesRead)) { success = false; break; }
-        sent += bytesRead;
-
-
-        if (progress && !progress(sent, fileSize)) {
-            success = false; m_lastError = "Cancelled"; break;
-        }
-    }
-
-    CloseHandle(hFile);
-
-    sendMsg(RSP_DONE);
-
-    // ALWAYS read server confirmation to keep TCP stream in sync
-    if (recvMsg(hdr, resp)) {
-        if (success && hdr.cmd == RSP_ERROR) {
-            m_lastError = std::string(resp.data(), resp.size());
-            return false;
-        }
-    }
-    return success;
+    return sendFileStream(file.get(), fileSize - offset, offset, false, false, progress);
 }
 
 // CRC32 — slicing-by-8 for ~4-8x speedup over byte-by-byte
@@ -3737,34 +3163,27 @@ uint32_t crc32Combine(uint32_t crc1, uint32_t crc2, uint64_t len2) {
     return crc1 ^ crc2;
 }
 
-static uint32_t computeLocalCrc32(const std::string& path, std::atomic<float>* progress = nullptr) {
-    initCrc32Table();
-    HANDLE hFile = CreateFileW(toWide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return 0;
-    // Low I/O priority for CRC — don't starve other apps
-    { FILE_IO_PRIORITY_HINT_INFO ph = { (PRIORITY_HINT)1 }; SetFileInformationByHandle(hFile, FileIoPriorityHintInfo, &ph, sizeof(ph)); }
-
-    // Get file size for progress
-    LARGE_INTEGER fileSize;
-    GetFileSizeEx(hFile, &fileSize);
-    uint64_t totalSize = (uint64_t)fileSize.QuadPart;
+static bool computeLocalCrc32(const std::string& path, uint32_t& result, std::atomic<float>* progress = nullptr) {
+    TransferFileHandle file(CreateFileW(toWide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file.get(), &size) || size.QuadPart < 0) return false;
+    std::vector<char> buffer(AFM_CHUNK_SIZE);
     uint64_t processed = 0;
-
     uint32_t crc = ~(uint32_t)0;
-    const size_t kBufSize = 4 * 1024 * 1024; // 4MB buffer
-    char* buf = new char[kBufSize];
-    DWORD bytesRead;
-    while (ReadFile(hFile, buf, (DWORD)kBufSize, &bytesRead, nullptr) && bytesRead > 0) {
-        crc32UpdateSlice8(crc, buf, bytesRead);
-        processed += bytesRead;
-        if (progress && totalSize > 0)
-            progress->store((float)((double)processed / (double)totalSize));
+    while (true) {
+        DWORD count = 0;
+        if (!ReadFile(file.get(), buffer.data(), (DWORD)buffer.size(), &count, nullptr)) return false;
+        if (!count) break;
+        crc32UpdateSlice8(crc, buffer.data(), count);
+        processed += count;
+        if (progress && size.QuadPart > 0) progress->store((float)((double)processed / size.QuadPart));
     }
+    if (processed != (uint64_t)size.QuadPart) return false;
     if (progress) progress->store(1.0f);
-    delete[] buf;
-    CloseHandle(hFile);
-    return ~crc;
+    result = ~crc;
+    return true;
 }
 
 bool DeviceClient::verifyFileCrc(const std::string& remotePath, const std::string& localPath, std::string& detail,
@@ -3773,8 +3192,9 @@ bool DeviceClient::verifyFileCrc(const std::string& remotePath, const std::strin
     if (!m_connected) { detail = "Not connected"; return false; }
 
     // Get local file size to estimate CRC computation time
-    uint64_t localFileSize = 0;
-    try { localFileSize = std::filesystem::file_size(toFsPath(localPath)); } catch (...) {}
+    std::error_code sizeError;
+    uint64_t localFileSize = std::filesystem::file_size(toFsPath(localPath), sizeError);
+    if (sizeError) { detail = "Cannot read local file for verification: " + sizeError.message(); return false; }
 
     // Scale recv timeout: ~200MB/s read speed on device, plus margin
     // Minimum 30s, add 1s per 100MB
@@ -3838,7 +3258,10 @@ bool DeviceClient::verifyFileCrc(const std::string& remotePath, const std::strin
     } else {
         // Fallback: compute from disk (resume transfers, etc.)
         LOG_INFO("CRC", "No inline CRC — reading file from disk");
-        localCrc = computeLocalCrc32(localPath, crcProgress);
+        if (!computeLocalCrc32(localPath, localCrc, crcProgress)) {
+            detail = "Failed to read the complete local file for verification";
+            return false;
+        }
     }
 
     auto localEnd = std::chrono::steady_clock::now();

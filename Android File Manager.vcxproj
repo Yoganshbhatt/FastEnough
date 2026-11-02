@@ -197,7 +197,13 @@
   <ItemGroup>
     <ClInclude Include="src\app.h" />
     <ClInclude Include="src\device_sessions.h" />
+    <ClInclude Include="src\background_work.h" />
+    <ClInclude Include="src\transfer_cancellation.h" />
+    <ClInclude Include="src\local_directory.h" />
+    <ClInclude Include="src\windows_file_entry.h" />
     <ClInclude Include="src\ui_widgets.h" />
+    <ClInclude Include="src\ui_transfer.h" />
+    <ClInclude Include="src\transfer_presentation.h" />
     <ClInclude Include="thirdparty\qrcodegen\qrcodegen.hpp" />
     <ClInclude Include="src\ui_panels.h" />
     <ClInclude Include="src\activity_log.h" />

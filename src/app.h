@@ -1,6 +1,10 @@
 #pragma once
 #include "device_client.h"
 #include "device_sessions.h"
+#include "background_work.h"
+#include "transfer_cancellation.h"
+#include "transfer_presentation.h"
+#include "windows_file_entry.h"
 #include "imgui.h"
 #include <string>
 #include <vector>
@@ -26,14 +30,6 @@ void updateTaskbarProgress(float fraction, bool active);
 void setTaskbarError();
 void setTaskbarPaused();
 
-struct WindowsFileEntry {
-    std::string name;
-    uint64_t size = 0;
-    std::string dateModified;
-    bool isDirectory = false;
-    bool isHidden = false;
-};
-
 // --- Transfer Batch System ---
 
 struct BatchFileItem {
@@ -48,8 +44,6 @@ struct BatchFileItem {
     std::string mcrawPath;      // path to the .mcraw container
     std::string virtualName;    // e.g. "frame_000001.dng"
 };
-
-enum class BatchState { Queued, Running, Paused, Verifying, Completed, Failed, Stopped, WaitingConflict };
 
 // User's choice when a destination file already exists
 enum class ConflictAction { None, Overwrite, Skip, OverwriteAll, SkipAll };
@@ -68,6 +62,7 @@ struct TransferBatch {
     }
 
     std::vector<BatchFileItem> files;
+    std::atomic<uint64_t> discoveredItems{0};
     bool isPull = true;      // Android -> Windows
     bool isLocalCopy = false; // Windows -> Windows (no device involved)
     bool isMove = false;     // move (delete source after transfer) vs copy
@@ -117,6 +112,8 @@ struct TransferBatch {
     std::atomic<BatchState> state{BatchState::Queued};
     std::atomic<bool> pauseRequested{false};
     std::atomic<bool> stopRequested{false};
+    TransferCancellation<DeviceClient> cancellation{stopRequested};
+    void requestStop() { cancellation.requestStop(); }
     std::atomic<bool> disconnected{false};  // set when connection lost mid-transfer
     std::atomic<bool> waitingForUserRetry{false}; // waiting for user to click retry or cancel
     std::atomic<bool> userRetryRequested{false};
@@ -127,6 +124,43 @@ struct TransferBatch {
     std::atomic<bool> waitingConflict{false};     // batch thread is waiting for user's conflict decision
     std::atomic<ConflictAction> conflictResponse{ConflictAction::None}; // UI thread sets this
     std::string conflictFileName;                  // name of the conflicting file (for display)
+    struct ConflictRequest {
+        uint64_t id = 0;
+        std::string fileName;
+        std::string sourcePath;
+        std::string destPath;
+    };
+    mutable std::mutex conflictMutex;
+    ConflictRequest conflictRequest;
+    void beginConflict(const BatchFileItem& item) {
+        std::lock_guard<std::mutex> lock(conflictMutex);
+        ++conflictRequest.id;
+        conflictRequest.fileName = item.displayName;
+        conflictRequest.sourcePath = item.sourcePath;
+        conflictRequest.destPath = item.destPath;
+        conflictFileName = item.displayName;
+        conflictResponse = ConflictAction::None;
+        state = BatchState::WaitingConflict;
+        waitingConflict = true;
+    }
+    bool pendingConflict(ConflictRequest& request) const {
+        std::lock_guard<std::mutex> lock(conflictMutex);
+        if (!waitingConflict || stopRequested || conflictResponse != ConflictAction::None) return false;
+        request = conflictRequest;
+        return true;
+    }
+    bool respondToConflict(uint64_t requestId, ConflictAction action) {
+        std::lock_guard<std::mutex> lock(conflictMutex);
+        if (!waitingConflict || stopRequested || conflictRequest.id != requestId ||
+            conflictResponse != ConflictAction::None || action == ConflictAction::None) return false;
+        conflictResponse = action;
+        return true;
+    }
+    ConflictAction finishConflict() {
+        std::lock_guard<std::mutex> lock(conflictMutex);
+        waitingConflict = false;
+        return conflictResponse.exchange(ConflictAction::None);
+    }
     ConflictAction conflictAllDecision = ConflictAction::None; // sticky "All" choice for this batch
     int skippedFiles = 0;                          // count of files skipped due to conflicts
     std::atomic<int> errorSkippedFiles{0};          // count of files skipped due to errors (ENOENT, etc.)
@@ -188,6 +222,12 @@ struct FilePanel {
     bool needsRefresh = true;
     bool refreshInProgress = false;
     uint64_t listingGeneration = 0;
+    uint64_t entriesRevision = 0;
+    uint64_t filterRevision = ~uint64_t(0);
+    std::string cachedFilter;
+    bool cachedShowHidden = false;
+    int cachedEntryCount = -1;
+    std::vector<int> filteredIndices;
     bool navigationTransitionPending = false;
     bool navigationTransitionReady = false;
     int hoveredEntryIndex = -1;
@@ -353,7 +393,7 @@ struct AppPreferences {
     bool transferDockExpanded = true;
     bool restartAdbOnLaunch = false;  // default OFF
     bool enableCrcVerification = true;
-    bool autoDismissTransfer = false; // auto-close transfer overlay on success
+    bool autoDismissTransfer = false; // retained for older preference files
     bool wifiAutoConnect = false;    // auto-setup WiFi ADB when USB connects (off until wizard completes)
     bool confirmOnClose = true;      // show yes/no dialog when pressing X (default ON)
     bool killAdbOnClose = false;
@@ -435,9 +475,20 @@ private:
         uint64_t listingGeneration = 0;
         int listingSlot = -1;
         bool listingApps = false;
+        bool listingWindows = false;
         std::string listingPath;
+        std::string listingError;
+        std::vector<WindowsFileEntry> listingWindowsEntries;
         std::vector<DeviceFileEntry> listingEntries;
         std::vector<InstalledAppEntry> listingAppEntries;
+        std::shared_ptr<TransferBatch> preparedBatch;
+        std::vector<BatchFileItem> preparedFiles;
+        uint64_t preparedBytes = 0;
+        std::string preparationError;
+        FilePanel* mountedPanel = nullptr;
+        uint64_t mountedGeneration = 0;
+        std::string mountedSource;
+        std::string mountedPath;
         bool saveDeviceSessions = false;
         bool deviceSessionReady = false;
         int readyDeviceSlot = -1;
@@ -539,6 +590,8 @@ private:
     void renderAppsPanel(FilePanel& panel, PanelSide side);
     void startAppUninstall(FilePanel& panel, bool useRoot);
     void renderTransferOverlay();
+    void updateTransferPresentation();
+    void renderTransferAttention();
     void renderStatusBar();
     void renderContextMenu(FilePanel& panel);
     void renderNewFolderPopup();
@@ -568,6 +621,7 @@ private:
     void renderCopyMoveDialog();
     void renderCrossDeviceDialog();
     void openAndroidFile(FilePanel& panel, int index);
+    void requestMcrawMount(FilePanel& panel, const std::string& path);
 
     void refreshWindowsPanel(FilePanel& panel);
     void refreshAndroidPanel(FilePanel& panel);
@@ -596,6 +650,8 @@ private:
     void startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel);
     void queuePanelTransfer(FilePanel& srcPanel, FilePanel& dstPanel, bool move);
     void processBatchQueue();
+    void prepareTransferManifest(const std::shared_ptr<TransferBatch>& batch);
+    void postListing(FilePanel* panel, std::function<void()> action);
 
     std::string queryDeviceDisplayName(const std::string& serial);
     static std::string formatSize(uint64_t bytes);
@@ -734,6 +790,11 @@ private:
     // Overlay state
     bool m_overlayVisible = false;
     bool m_overlayWasOpen = false;
+    TransferResultRetention m_transferResultRetention;
+    uint64_t m_transferAttentionBatchId = 0;
+    TransferBatch::ConflictRequest m_transferAttentionRequest;
+    bool m_transferAttentionApplyAll = false;
+    bool m_transferAttentionFocus = false;
 
     // Notification popup (for important user-facing messages)
     bool m_showNotification = false;
@@ -770,7 +831,7 @@ private:
     bool m_showDeviceSettings = false;
     bool m_showTransferChannels = false;
     std::weak_ptr<TransferBatch> m_transferDetailsBatch;
-    std::weak_ptr<TransferBatch> m_lastDockBatch;
+    std::weak_ptr<TransferBatch> m_cancelDockBatch;
     int m_backupManagerSlot = 0;
     char m_backupManagerSearch[256] = {};
     int m_backupManagerAppPage = 0;
@@ -948,6 +1009,8 @@ private:
     // Async action queue — UI thread posts, background worker executes
     // This ensures the UI NEVER blocks on DeviceClient operations
     std::thread m_asyncThread;
+    BackgroundWork m_listingWork{2, [](std::exception_ptr) { LOG_ERROR("Files", "Folder worker failed"); }};
+    BackgroundWork m_manifestWork{1, [](std::exception_ptr) { LOG_ERROR("Transfer", "Source scan worker failed"); }};
     std::mutex m_asyncMutex;
     std::condition_variable m_asyncCV;
     std::deque<std::function<void()>> m_asyncQueue;
