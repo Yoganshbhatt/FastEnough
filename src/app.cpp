@@ -1781,6 +1781,7 @@ void App::drainUiMessages() {
             m_backupRootAccessSerial = message.backupRootSerial;
             m_backupRootAccess = message.backupRootAvailable ? BackupRootAccess::Available : BackupRootAccess::Unavailable;
             if (message.backupRootAvailable) {
+                m_showBackupRootChoice = false;
                 m_backupIncludeData = true;
                 m_backupIncludeDeData = true;
             } else {
@@ -7411,24 +7412,28 @@ void App::renderBackupManagerWindow() {
         m_showBackupRootChoice = false;
     }
     if (ImGui::BeginPopupModal("Backup capabilities", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        if (m_backupRootAccess == BackupRootAccess::Checking)
-            ImGui::TextColored(ImVec4(0.35f, 0.70f, 1.0f, 1), "Checking root access...");
-        else
-            ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.25f, 1), "Root access was not detected");
-        ImGui::Spacing();
-        ImGui::TextWrapped("Fast Enough can still back up APK files and shared app folders. Private app data and device-protected data require root access.");
-        ImGui::Spacing();
-        ImGui::TextDisabled("Choose how you want to continue for this device.");
-        ImGui::Spacing();
-        if (modernButton("Use Standard Backup", ImVec2(200, 0))) {
-            m_backupIncludeData = false;
-            m_backupIncludeDeData = false;
+        if (backupRootEnabled || !hasDevice) {
             ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (modernButton("Check Root Again", ImVec2(200, 0))) {
-            m_backupRootAccess = BackupRootAccess::Unknown;
-            m_backupRootAccessSerial.clear();
+        } else {
+            if (m_backupRootAccess == BackupRootAccess::Checking || m_backupRootAccess == BackupRootAccess::Unknown)
+                ImGui::TextColored(ImVec4(0.35f, 0.70f, 1.0f, 1), "Checking root access...");
+            else
+                ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.25f, 1), "Root access was not detected");
+            ImGui::Spacing();
+            ImGui::TextWrapped("Fast Enough can still back up APK files and shared app folders. Private app data and device-protected data require root access.");
+            ImGui::Spacing();
+            ImGui::TextDisabled("Choose how you want to continue for this device.");
+            ImGui::Spacing();
+            if (modernButton("Use Standard Backup", ImVec2(200, 0))) {
+                m_backupIncludeData = false;
+                m_backupIncludeDeData = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (modernButton("Check Root Again", ImVec2(200, 0))) {
+                m_backupRootAccess = BackupRootAccess::Unknown;
+                m_backupRootAccessSerial.clear();
+            }
         }
         ImGui::EndPopup();
     }
@@ -8856,18 +8861,23 @@ void App::requestApkInstall(const std::string& apkPath) {
 }
 
 void App::renderApkInstallDialog() {
-    if (m_showApkInstallDialog) {
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    // A minimized window reports a zero-sized viewport, so wait until it is restored.
+    const bool viewportReady = viewport->WorkSize.x >= 200.0f && viewport->WorkSize.y >= 200.0f;
+    if (m_showApkInstallDialog && viewportReady) {
         ImGui::OpenPopup("Install APK");
         m_showApkInstallDialog = false;
     }
 
-    ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImVec2 center = viewport->GetCenter();
     float maxW = std::max(420.0f, viewport->WorkSize.x - 32.0f);
     float maxH = std::max(260.0f, viewport->WorkSize.y - 32.0f);
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    // Keep the dialog centered as the window resizes or the dialog content changes size.
+    if (viewportReady)
+        ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSizeConstraints(ImVec2(420, 0), ImVec2(maxW, maxH));
-    if (ImGui::BeginPopupModal("Install APK", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+    if (ImGui::BeginPopupModal("Install APK", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
         std::string apkName = m_pendingApkPath;
         auto slash = apkName.find_last_of("\\/");
         if (slash != std::string::npos) apkName = apkName.substr(slash + 1);

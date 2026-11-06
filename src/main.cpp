@@ -275,7 +275,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 cds.lpData = (void*)launchApkPath.c_str();
                 SendMessage(existing, WM_COPYDATA, 0, (LPARAM)&cds);
             }
-            ShowWindow(existing, SW_SHOW);
+            ShowWindow(existing, IsIconic(existing) ? SW_RESTORE : SW_SHOW);
             SetForegroundWindow(existing);
         }
         CloseHandle(hMutex);
@@ -590,7 +590,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (cds && cds->dwData == 0x41504B31 && cds->lpData && cds->cbData > 1) {
             std::string apkPath(static_cast<const char*>(cds->lpData));
             g_pApp->requestApkInstall(apkPath);
-            ShowWindow(hWnd, SW_SHOW);
+            ShowWindow(hWnd, IsIconic(hWnd) ? SW_RESTORE : SW_SHOW);
             SetForegroundWindow(hWnd);
             RemoveTrayIcon();
             return TRUE;
